@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>livox_lvx2_ros2_publisher</name>
+  <version>0.0.1</version>
+  <description>A ROS 2 package to parse and publish Livox LVX v2.0.0.0 file data as PointCloud2 and Imu messages.</description>
+  <maintainer email="rosdeveloper@example.com">ROS Developer</maintainer>
+  <license>Apache License 2.0</license> <!-- Or your preferred license -->
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>builtin_interfaces</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
