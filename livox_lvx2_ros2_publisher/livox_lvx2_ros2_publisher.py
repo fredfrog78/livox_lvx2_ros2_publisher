@@ -77,7 +77,7 @@ class Lvx2ParserNode(Node):
 
             sig_bytes, vA, vB, vC, vD, magic_code = struct.unpack('<16scBBBI', data) # [cite: 23]
             file_signature = sig_bytes.split(b'\0', 1)[0].decode('ascii', errors='ignore') # [cite: 25]
-            version_tuple = (vA, vB, vC, vD) # [cite: 23]
+            version_tuple = (ord(vA), vB, vC, vD) # vA is char, convert to int [cite: 23]
 
             self.get_logger().info(f"  File Signature: {file_signature}")
             self.get_logger().info(f"  Version: {version_tuple}") # [cite: 28]
@@ -129,9 +129,9 @@ class Lvx2ParserNode(Node):
         for i in range(self.device_count):
             self.get_logger().info(f"  Parsing Device Info {i}...")
             try:
-                dev_info_data = f.read(63) # [cite: 36]
-                if len(dev_info_data) < 63:
-                    self.get_logger().error(f"Device Info {i}: Unexpected EOF.")
+                dev_info_data = f.read(66) # [cite: 36] Corrected size
+                if len(dev_info_data) < 66: # Corrected size
+                    self.get_logger().error(f"Device Info {i}: Unexpected EOF. Expected 66 bytes, got {len(dev_info_data)}.")
                     return False
 
                 # [cite: 39, 42]
