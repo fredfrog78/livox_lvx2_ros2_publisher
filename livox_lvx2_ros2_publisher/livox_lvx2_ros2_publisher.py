@@ -47,10 +47,6 @@ class Lvx2ParserNode(Node):
         self.playback_rate_hz = self.get_parameter('playback_rate_hz').get_parameter_value().double_value
         self.loop_playback = self.get_parameter('loop_playback').get_parameter_value().bool_value
 
-        # For profiling: limit the number of frames to process
-        self.max_frames_to_profile = 1 # Reduced for profiling
-        self.profiling_finished_stop_loop = False
-
         if not self.lvx_file_path or not os.path.exists(self.lvx_file_path):
             self.get_logger().error(f"LVX file path is invalid or file does not exist: {self.lvx_file_path}")
             #rclpy.shutdown() # Avoid shutting down here if used as a library
@@ -241,9 +237,6 @@ class Lvx2ParserNode(Node):
         self.get_logger().info("Node self-initiating shutdown as processing is complete.")
         if rclpy.ok():
             rclpy.shutdown()
-        # More forceful exit for profiling
-        self.get_logger().info("Exiting script via sys.exit(0) for profiling.")
-        sys.exit(0)
 
     def _parse_point_cloud_data_block(self, f):
         self.get_logger().info("Parsing Point Cloud Data Block...")
@@ -257,11 +250,6 @@ class Lvx2ParserNode(Node):
 
 
         while rclpy.ok():
-            if frame_count_overall >= self.max_frames_to_profile:
-                self.get_logger().info(f"Reached max_frames_to_profile ({self.max_frames_to_profile}). Stopping point cloud parsing.")
-                self.profiling_finished_stop_loop = True
-                break
-
             f.seek(current_frame_offset_in_file)
             frame_header_data = f.read(24) # [cite: 47] Frame Header size
             if len(frame_header_data) < 24:
@@ -545,11 +533,6 @@ class Lvx2ParserNode(Node):
                     f.seek(start_of_point_cloud_data_block)
                     if not self._parse_point_cloud_data_block(f):
                         self.get_logger().error("Failed to parse point cloud data block.")
-                        break
-
-                    if hasattr(self, 'profiling_finished_stop_loop') and self.profiling_finished_stop_loop:
-                        self.get_logger().info("Profiling finished, ensuring shutdown.")
-                        self._initiate_shutdown()
                         break
 
                     if self.loop_playback and rclpy.ok():
