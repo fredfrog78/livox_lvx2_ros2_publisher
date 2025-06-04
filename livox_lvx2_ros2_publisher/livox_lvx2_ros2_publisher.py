@@ -344,40 +344,40 @@ class Lvx2ParserNode(Node):
                 x_m_arr = np.array([])
                 y_m_arr = np.array([])
                 z_m_arr = np.array([])
-                reflectivity_arr = np.array([])
+                intensity_arr = np.array([])
                 tag_arr = np.array([])
 
                 if num_points_in_package > 0:
                     if data_type == 0x01 or data_type == 0x00:
-                        # LVX2 Spec: x(int, mm), y(int, mm), z(int, mm), reflectivity(uchar), tag(uchar)
+                        # LVX2 Spec: x(int, mm), y(int, mm), z(int, mm), intensity(uchar), tag(uchar)
                         dtype_mm = np.dtype([
                             ('x_mm', '<i4'), ('y_mm', '<i4'), ('z_mm', '<i4'),
-                            ('reflectivity', 'u1'), ('tag', 'u1')
+                            ('intensity', 'u1'), ('tag', 'u1')
                         ])
                         points_array = np.frombuffer(raw_points_data, dtype=dtype_mm, count=num_points_in_package)
                         x_m_arr = points_array['x_mm'].astype(np.float32) / 1000.0
                         y_m_arr = points_array['y_mm'].astype(np.float32) / 1000.0
                         z_m_arr = points_array['z_mm'].astype(np.float32) / 1000.0
-                        reflectivity_arr = points_array['reflectivity']
+                        intensity_arr = points_array['intensity']
                         tag_arr = points_array['tag']
                     elif data_type == 0x02:
-                        # LVX2 Spec: x(short, cm), y(short, cm), z(short, cm), reflectivity(uchar), tag(uchar)
+                        # LVX2 Spec: x(short, cm), y(short, cm), z(short, cm), intensity(uchar), tag(uchar)
                         dtype_cm = np.dtype([
                             ('x_cm', '<h'), ('y_cm', '<h'), ('z_cm', '<h'),
-                            ('reflectivity', 'u1'), ('tag', 'u1')
+                            ('intensity', 'u1'), ('tag', 'u1')
                         ])
                         points_array = np.frombuffer(raw_points_data, dtype=dtype_cm, count=num_points_in_package)
                         x_m_arr = points_array['x_cm'].astype(np.float32) / 100.0
                         y_m_arr = points_array['y_cm'].astype(np.float32) / 100.0
                         z_m_arr = points_array['z_cm'].astype(np.float32) / 100.0
-                        reflectivity_arr = points_array['reflectivity']
+                        intensity_arr = points_array['intensity']
                         tag_arr = points_array['tag']
 
                     # This section replaces the old loop that used current_points_packed_list.append(struct.pack(...))
                     # Define the dtype for the output PointCloud2 structure for these fields
                     dtype_pointcloud_point = np.dtype([
                         ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
-                        ('reflectivity', 'u1'), ('tag', 'u1')
+                        ('intensity', 'u1'), ('tag', 'u1')
                     ])
                     # Create an empty structured array for the output points
                     packed_points_arr = np.empty(num_points_in_package, dtype=dtype_pointcloud_point)
@@ -386,7 +386,7 @@ class Lvx2ParserNode(Node):
                     packed_points_arr['x'] = x_m_arr
                     packed_points_arr['y'] = y_m_arr
                     packed_points_arr['z'] = z_m_arr
-                    packed_points_arr['reflectivity'] = reflectivity_arr
+                    packed_points_arr['intensity'] = intensity_arr
                     packed_points_arr['tag'] = tag_arr
 
                     # Convert the structured NumPy array to a byte string
@@ -467,7 +467,7 @@ class Lvx2ParserNode(Node):
                     make_point_field("x", 0, PointField.FLOAT32),
                     make_point_field("y", 4, PointField.FLOAT32),
                     make_point_field("z", 8, PointField.FLOAT32),
-                    make_point_field("reflectivity", 12, PointField.UINT8),
+                    make_point_field("intensity", 12, PointField.UINT8),
                     make_point_field("tag", 13, PointField.UINT8)
                 ]
                 pc_msg.point_step = 14 # 3*4 + 1 + 1 bytes
