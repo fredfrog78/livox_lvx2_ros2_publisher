@@ -450,8 +450,8 @@ class Lvx2ParserNode(Node):
                     continue
 
                 all_points_bytes = b''.join(collected_data['points_bytes_list'])
-                # Each packed point is 3*float(4 bytes) + 2*uint8(1 byte) = 12 + 2 = 14 bytes
-                num_total_points_for_lidar = len(all_points_bytes) // 14
+                # Each packed point is: x(f4), y(f4), z(f4), intensity(f4), tag(u1) = 4+4+4+4+1 = 17 bytes
+                num_total_points_for_lidar = len(all_points_bytes) // 17
 
                 if lidar_id not in self.publishers_:
                     self.get_logger().warning(f"Frame {frame_idx}: LiDAR ID {lidar_id} has data but no PointCloud2 publisher. Skipping.")
