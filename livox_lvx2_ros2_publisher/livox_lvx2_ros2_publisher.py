@@ -11,6 +11,7 @@ import math
 import struct
 import time
 import os
+import numpy as np
 
 # Helper function to convert Livox timestamp (nanoseconds) to ROS Time
 def livox_ts_to_ros_time(timestamp_ns):
@@ -129,15 +130,16 @@ class Lvx2ParserNode(Node):
         for i in range(self.device_count):
             self.get_logger().info(f"  Parsing Device Info {i}...")
             try:
-                dev_info_data = f.read(66) # [cite: 36] Corrected size
-                if len(dev_info_data) < 66: # Corrected size
-                    self.get_logger().error(f"Device Info {i}: Unexpected EOF. Expected 66 bytes, got {len(dev_info_data)}.")
+                # Device Info structure (SN, HubSN, ID, LidarType, DevType, ExtEnable, 6xExtrinsics), total 63 bytes as per spec fields [cite: 36, 39, 42]
+                dev_info_data = f.read(63)
+                if len(dev_info_data) < 63:
+                    self.get_logger().error(f"Device Info {i}: Unexpected EOF. Expected 63 bytes, got {len(dev_info_data)}.")
                     return False
 
                 # [cite: 39, 42]
                 lidar_sn_bytes, hub_sn_bytes, lidar_id, lidar_type_reserved, device_type, \
                 extrinsic_enable, roll, pitch, yaw, x, y, z = \
-                struct.unpack('<16s16sIBBfffffff', dev_info_data)
+                struct.unpack('<16s16sIBBBffffff', dev_info_data)
 
                 lidar_sn = lidar_sn_bytes.split(b'\0',1)[0].decode('ascii', errors='ignore') # [cite: 39]
                 hub_sn = hub_sn_bytes.split(b'\0',1)[0].decode('ascii', errors='ignore') # [cite: 39]
@@ -150,11 +152,13 @@ class Lvx2ParserNode(Node):
                 self.get_logger().info(f"    Extrinsics (R,P,Y,X,Y,Z): {roll:.2f}deg, {pitch:.2f}deg, {yaw:.2f}deg, {x:.2f}m, {y:.2f}m, {z:.2f}m") # [cite: 42]
 
                 device_frame_id = f"{self.lidar_frame_id_prefix}{lidar_id}"
+                imu_frame_id = f"{device_frame_id}_imu"
                 self.device_infos_[lidar_id] = {
                     'sn': lidar_sn,
                     'frame_id': device_frame_id,
+                    'imu_frame_id': imu_frame_id, # Add this new key
                     'type': device_type,
-                    'roll_deg': roll, 'pitch_deg': pitch, 'yaw_deg': yaw, # Store for IMU
+                    'roll_deg': roll, 'pitch_deg': pitch, 'yaw_deg': yaw,
                     'extrinsic_enable': extrinsic_enable
                 }
 
@@ -182,6 +186,27 @@ class Lvx2ParserNode(Node):
                     self.static_broadcaster_.sendTransform(t)
                     self.get_logger().info(f"    Published static transform for {device_frame_id} relative to {self.base_frame_id}")
 
+                    # Create and broadcast the static transform for the IMU relative to the LiDAR
+                    t_imu = geometry_msgs.msg.TransformStamped()
+                    t_imu.header.stamp = self.get_clock().now().to_msg() # Use current time for static transform
+                    t_imu.header.frame_id = device_frame_id  # Parent is the LiDAR frame
+                    t_imu.child_frame_id = imu_frame_id   # Child is the new IMU frame
+
+                    # Set the translation based on the Livox Mid-360 User Manual (page 17)
+                    # x=11.0 mm, y=23.29 mm, z=-44.12 mm
+                    t_imu.transform.translation.x = 0.011
+                    t_imu.transform.translation.y = 0.02329
+                    t_imu.transform.translation.z = -0.04412
+
+                    # The IMU shares the same orientation as the LiDAR frame, so rotation is identity
+                    t_imu.transform.rotation.x = 0.0
+                    t_imu.transform.rotation.y = 0.0
+                    t_imu.transform.rotation.z = 0.0
+                    t_imu.transform.rotation.w = 1.0
+
+                    self.static_broadcaster_.sendTransform(t_imu)
+                    self.get_logger().info(f"    Published static transform for {imu_frame_id} relative to {device_frame_id}")
+
                     # Create IMU publisher
                     imu_topic_name = f"{self.imu_topic_prefix}{lidar_id}"
                     self.imu_publishers_[lidar_id] = self.create_publisher(Imu, imu_topic_name, data_qos_profile)
@@ -206,6 +231,11 @@ class Lvx2ParserNode(Node):
         q[1] = cr * sp * cy + sr * cp * sy  # y
         q[2] = cr * cp * sy - sr * sp * cy  # z
         return q
+
+    def _initiate_shutdown(self):
+        self.get_logger().info("Node self-initiating shutdown as processing is complete.")
+        if rclpy.ok():
+            rclpy.shutdown()
 
     def _parse_point_cloud_data_block(self, f):
         self.get_logger().info("Parsing Point Cloud Data Block...")
@@ -246,19 +276,40 @@ class Lvx2ParserNode(Node):
 
             while package_read_pos < frame_end_pos and rclpy.ok():
                 f.seek(package_read_pos)
-                pkg_header_bytes = f.read(27) # Package header size from page 7, calculated as 1+4+1+1+8+2+1+4+1+4=27 [cite: 52]
+                pkg_header_bytes = f.read(27) # Package header (Version, LiDAR ID, LiDAR_Type, Timestamp Type, Timestamp(8s), Udp Counter, Data Type(B), Length(I), Frame_Counter, Reserve(4s)), total 27 bytes [cite: 52]
                 if len(pkg_header_bytes) < 27:
                     self.get_logger().warning(f"Frame {frame_idx}: Truncated package header at {package_read_pos}.")
                     break
 
                 # Unpack package header fields [cite: 52]
-                pkg_ver, lidar_id, lidar_type_res, ts_type, \
-                ts_b1,ts_b2,ts_b3,ts_b4,ts_b5,ts_b6,ts_b7,ts_b8, \
-                udp_counter, data_type, point_data_len, frame_ctr_res, \
-                res_b1,res_b2,res_b3,res_b4 = struct.unpack('<BIBBccccccccHIHBcccc', pkg_header_bytes)
+                # Adjust unpack format for 28 bytes. Assuming the extra byte is at the end as part of 'reserved_bytes' or similar.
+                # Original: <BIBBccccccccHIHBcccc (27 bytes)
+                # New format might be <BIBBccccccccHIHBccccc if the last 'cccc' (4 bytes) becomes 'ccccc' (5 bytes)
+                # Or, if a new field is added. The comment implies point_data_len changed size or a new field was added.
+                # Comment calculation: 1+4+1+1+8+2+4+2+1+4 = 28.
+                # Original fields:         pkg_ver (B,1), lidar_id (I,4), lidar_type_res (B,1), ts_type (B,1), timestamp (8c,8), udp_counter (H,2), data_type (I,4 -> this seems to be the change from B,1 in old comment), point_data_len (H,2), frame_ctr_res (B,1), res (4c, 4)
+                # Old comment calculation: 1+4+1+1+8+2+1+4+1+4 = 27.  Fields: pkg_ver, lidar_id, lidar_type_res, ts_type, timestamp, udp_counter, data_type(B,1), point_data_len(I,4), frame_ctr_res(B,1), res(4c,4)
+                # The new comment says data_type is 2 bytes (H) and point_data_len is 4 bytes (I)
+                # And frame_ctr_res is 1 byte (B), and a final reserved_bytes is 4 bytes (say, '4s' or 'cccc')
+                # Let's re-evaluate based on the new comment's sum:
+                # pkg_ver (B, 1)
+                # lidar_id (I, 4)
+                # lidar_type_res (B, 1) -> this is 'reserved' in the new comment
+                # ts_type (B, 1)
+                # timestamp (Q, 8) -> this is `cccccccc` (8c) in old unpack, so 8 bytes
+                # udp_counter (H, 2)
+                # data_type (H, 2) -> THIS IS THE CHANGE. Old comment: (B,1), New comment: (H,2)
+                # point_data_len (I, 4) -> THIS IS THE CHANGE. Old comment: (H,2), New comment: (I,4)
+                # frame_counter_reserved (B,1)
+                # reserved_bytes (4s or I, 4) -> this is `cccc` (4c) in old unpack.
+                # Old unpack: B I B B 8s H B I B 4s  (1+4+1+1+8+2+1+4+1+4 = 27)
+                # New unpack: B I B B 8s H H I B 4s  (1+4+1+1+8+2+2+4+1+4 = 28)
 
-                timestamp_bytes_from_pkg = b''.join((ts_b1,ts_b2,ts_b3,ts_b4,ts_b5,ts_b6,ts_b7,ts_b8))
-                pkg_timestamp_ns = struct.unpack('<Q', timestamp_bytes_from_pkg)[0] # [cite: 52] nanosecond timestamp
+                pkg_ver, lidar_id, lidar_type_res, ts_type, \
+                timestamp_bytes, udp_counter, data_type, point_data_len, \
+                frame_ctr_res, reserved_final_bytes = struct.unpack('<BIBB8sHBIB4s', pkg_header_bytes)
+
+                pkg_timestamp_ns = struct.unpack('<Q', timestamp_bytes)[0] # [cite: 52] nanosecond timestamp
 
                 if current_frame_first_pkg_ts_ns is None:
                     current_frame_first_pkg_ts_ns = pkg_timestamp_ns
@@ -279,10 +330,9 @@ class Lvx2ParserNode(Node):
                 elif points_by_lidar_in_frame[lidar_id]['data_type'] != data_type:
                      self.get_logger().warning(f"Frame {frame_idx}, LiDAR {lidar_id}: Mixed data types in packages. Using type {points_by_lidar_in_frame[lidar_id]['data_type']}.")
                 
-                # Convert points now and store them as a list of packed bytes for that lidar
-                current_points_packed_list = points_by_lidar_in_frame[lidar_id]['points_bytes_list']
+                # Removed: current_points_packed_list = points_by_lidar_in_frame[lidar_id]['points_bytes_list']
                 bytes_per_point_lvx = 0
-                if data_type == 0x01: bytes_per_point_lvx = 14 # [cite: 52]
+                if data_type == 0x01 or data_type == 0x00: bytes_per_point_lvx = 14 # [cite: 52]
                 elif data_type == 0x02: bytes_per_point_lvx = 8 # [cite: 52]
                 else:
                     self.get_logger().warning(f"Frame {frame_idx}, LiDAR {lidar_id}: Unknown data_type {data_type}. Skipping package.")
@@ -290,15 +340,63 @@ class Lvx2ParserNode(Node):
                 
                 num_points_in_package = point_data_len // bytes_per_point_lvx if bytes_per_point_lvx > 0 else 0
 
-                for i in range(num_points_in_package):
-                    point_offset_in_pkg = i * bytes_per_point_lvx
-                    if data_type == 0x01: # [cite: 55]
-                        x_mm, y_mm, z_mm, reflectivity, tag = struct.unpack_from('<iiibB', raw_points_data, point_offset_in_pkg)
-                        x_m, y_m, z_m = x_mm / 1000.0, y_mm / 1000.0, z_mm / 1000.0 # Convert mm to m
-                    elif data_type == 0x02: # [cite: 57]
-                        x_cm, y_cm, z_cm, reflectivity, tag = struct.unpack_from('<hhhBB', raw_points_data, point_offset_in_pkg)
-                        x_m, y_m, z_m = x_cm / 100.0, y_cm / 100.0, z_cm / 100.0 # Convert cm to m
-                    current_points_packed_list.append(struct.pack('<fffBB', float(x_m), float(y_m), float(z_m), reflectivity, tag))
+                # Placeholder for the new NumPy arrays
+                x_m_arr = np.array([])
+                y_m_arr = np.array([])
+                z_m_arr = np.array([])
+                reflectivity_arr = np.array([])
+                tag_arr = np.array([])
+
+                if num_points_in_package > 0:
+                    if data_type == 0x01 or data_type == 0x00:
+                        # LVX2 Spec: x(int, mm), y(int, mm), z(int, mm), reflectivity(uchar), tag(uchar)
+                        dtype_mm = np.dtype([
+                            ('x_mm', '<i4'), ('y_mm', '<i4'), ('z_mm', '<i4'),
+                            ('reflectivity', 'u1'), ('tag', 'u1')
+                        ])
+                        points_array = np.frombuffer(raw_points_data, dtype=dtype_mm, count=num_points_in_package)
+                        x_m_arr = points_array['x_mm'].astype(np.float32) / 1000.0
+                        y_m_arr = points_array['y_mm'].astype(np.float32) / 1000.0
+                        z_m_arr = points_array['z_mm'].astype(np.float32) / 1000.0
+                        reflectivity_arr = points_array['reflectivity']
+                        tag_arr = points_array['tag']
+                    elif data_type == 0x02:
+                        # LVX2 Spec: x(short, cm), y(short, cm), z(short, cm), reflectivity(uchar), tag(uchar)
+                        dtype_cm = np.dtype([
+                            ('x_cm', '<h'), ('y_cm', '<h'), ('z_cm', '<h'),
+                            ('reflectivity', 'u1'), ('tag', 'u1')
+                        ])
+                        points_array = np.frombuffer(raw_points_data, dtype=dtype_cm, count=num_points_in_package)
+                        x_m_arr = points_array['x_cm'].astype(np.float32) / 100.0
+                        y_m_arr = points_array['y_cm'].astype(np.float32) / 100.0
+                        z_m_arr = points_array['z_cm'].astype(np.float32) / 100.0
+                        reflectivity_arr = points_array['reflectivity']
+                        tag_arr = points_array['tag']
+
+                    # This section replaces the old loop that used current_points_packed_list.append(struct.pack(...))
+                    # Define the dtype for the output PointCloud2 structure for these fields
+                    dtype_pointcloud_point = np.dtype([
+                        ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                        ('reflectivity', 'u1'), ('tag', 'u1')
+                    ])
+                    # Create an empty structured array for the output points
+                    packed_points_arr = np.empty(num_points_in_package, dtype=dtype_pointcloud_point)
+
+                    # Populate the structured array
+                    packed_points_arr['x'] = x_m_arr
+                    packed_points_arr['y'] = y_m_arr
+                    packed_points_arr['z'] = z_m_arr
+                    packed_points_arr['reflectivity'] = reflectivity_arr
+                    packed_points_arr['tag'] = tag_arr
+
+                    # Convert the structured NumPy array to a byte string
+                    package_points_bytes = packed_points_arr.tobytes()
+
+                    # Append this package's byte string to the list for the current lidar_id
+                    # This assumes points_by_lidar_in_frame[lidar_id]['points_bytes_list'] is initialized as a list
+                    points_by_lidar_in_frame[lidar_id]['points_bytes_list'].append(package_points_bytes)
+                # If num_points_in_package was 0, x_m_arr etc. would be empty,
+                # and no bytes are added for this package, which is correct.
 
 
             # Determine the timestamp for publishing messages for THIS frame
@@ -383,19 +481,16 @@ class Lvx2ParserNode(Node):
                     dev_info = self.device_infos_[lidar_id]
                     imu_msg = Imu()
                     imu_msg.header.stamp = ros_frame_publish_time
-                    imu_msg.header.frame_id = dev_info['frame_id']
+                    # Set the frame_id to the specific IMU frame
+                    imu_msg.header.frame_id = dev_info['imu_frame_id']
 
-                    q_orientation = self.euler_to_quaternion(
-                        math.radians(dev_info['roll_deg']),
-                        math.radians(dev_info['pitch_deg']),
-                        math.radians(dev_info['yaw_deg'])
-                    )
-                    imu_msg.orientation.x = q_orientation[0]
-                    imu_msg.orientation.y = q_orientation[1]
-                    imu_msg.orientation.z = q_orientation[2]
-                    imu_msg.orientation.w = q_orientation[3]
-                    # Small covariance for orientation if extrinsics are trusted
-                    imu_msg.orientation_covariance = [0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01]
+                    # Orientation is now provided by the TF tree, so set to identity and mark as unavailable.
+                    imu_msg.orientation.x = 0.0
+                    imu_msg.orientation.y = 0.0
+                    imu_msg.orientation.z = 0.0
+                    imu_msg.orientation.w = 1.0
+                    # Mark orientation covariance as unavailable, as it is defined by the static transform
+                    imu_msg.orientation_covariance = [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
                     # Angular velocity and linear acceleration are not in LVX2 file
                     imu_msg.angular_velocity.x = 0.0
@@ -446,6 +541,7 @@ class Lvx2ParserNode(Node):
                         time.sleep(0.1) # Brief pause before looping
                     else:
                         self.get_logger().info("Playback finished (or loop_playback is false).")
+                        self._initiate_shutdown() # ADD THIS LINE
                         break
         except FileNotFoundError:
             self.get_logger().error(f"LVX file not found: {self.lvx_file_path}")
