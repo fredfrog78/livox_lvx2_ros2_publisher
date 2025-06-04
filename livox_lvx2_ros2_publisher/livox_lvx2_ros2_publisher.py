@@ -12,6 +12,7 @@ import struct
 import time
 import os
 import numpy as np
+import sys # Import sys for explicit exit
 
 # Helper function to convert Livox timestamp (nanoseconds) to ROS Time
 def livox_ts_to_ros_time(timestamp_ns):
@@ -45,6 +46,10 @@ class Lvx2ParserNode(Node):
         self.use_original_timestamps = self.get_parameter('use_original_timestamps').get_parameter_value().bool_value
         self.playback_rate_hz = self.get_parameter('playback_rate_hz').get_parameter_value().double_value
         self.loop_playback = self.get_parameter('loop_playback').get_parameter_value().bool_value
+
+        # For profiling: limit the number of frames to process
+        self.max_frames_to_profile = 1 # Reduced for profiling
+        self.profiling_finished_stop_loop = False
 
         if not self.lvx_file_path or not os.path.exists(self.lvx_file_path):
             self.get_logger().error(f"LVX file path is invalid or file does not exist: {self.lvx_file_path}")
@@ -236,6 +241,9 @@ class Lvx2ParserNode(Node):
         self.get_logger().info("Node self-initiating shutdown as processing is complete.")
         if rclpy.ok():
             rclpy.shutdown()
+        # More forceful exit for profiling
+        self.get_logger().info("Exiting script via sys.exit(0) for profiling.")
+        sys.exit(0)
 
     def _parse_point_cloud_data_block(self, f):
         self.get_logger().info("Parsing Point Cloud Data Block...")
@@ -249,6 +257,11 @@ class Lvx2ParserNode(Node):
 
 
         while rclpy.ok():
+            if frame_count_overall >= self.max_frames_to_profile:
+                self.get_logger().info(f"Reached max_frames_to_profile ({self.max_frames_to_profile}). Stopping point cloud parsing.")
+                self.profiling_finished_stop_loop = True
+                break
+
             f.seek(current_frame_offset_in_file)
             frame_header_data = f.read(24) # [cite: 47] Frame Header size
             if len(frame_header_data) < 24:
@@ -358,7 +371,6 @@ class Lvx2ParserNode(Node):
                         x_m_arr = points_array['x_mm'].astype(np.float32) / 1000.0
                         y_m_arr = points_array['y_mm'].astype(np.float32) / 1000.0
                         z_m_arr = points_array['z_mm'].astype(np.float32) / 1000.0
-                        intensity_arr = points_array['intensity']
                         intensity_arr = intensity_arr.astype(np.float32) / 255.0
                         tag_arr = points_array['tag']
                     elif data_type == 0x02:
@@ -371,7 +383,6 @@ class Lvx2ParserNode(Node):
                         x_m_arr = points_array['x_cm'].astype(np.float32) / 100.0
                         y_m_arr = points_array['y_cm'].astype(np.float32) / 100.0
                         z_m_arr = points_array['z_cm'].astype(np.float32) / 100.0
-                        intensity_arr = points_array['intensity']
                         intensity_arr = intensity_arr.astype(np.float32) / 255.0
                         tag_arr = points_array['tag']
 
@@ -534,7 +545,12 @@ class Lvx2ParserNode(Node):
                     f.seek(start_of_point_cloud_data_block)
                     if not self._parse_point_cloud_data_block(f):
                         self.get_logger().error("Failed to parse point cloud data block.")
-                        break 
+                        break
+
+                    if hasattr(self, 'profiling_finished_stop_loop') and self.profiling_finished_stop_loop:
+                        self.get_logger().info("Profiling finished, ensuring shutdown.")
+                        self._initiate_shutdown()
+                        break
 
                     if self.loop_playback and rclpy.ok():
                         self.get_logger().info("Looping playback from the beginning.")
@@ -543,7 +559,7 @@ class Lvx2ParserNode(Node):
                         time.sleep(0.1) # Brief pause before looping
                     else:
                         self.get_logger().info("Playback finished (or loop_playback is false).")
-                        self._initiate_shutdown() # ADD THIS LINE
+                        self._initiate_shutdown()
                         break
         except FileNotFoundError:
             self.get_logger().error(f"LVX file not found: {self.lvx_file_path}")

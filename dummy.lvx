@@ -1,0 +1,33 @@
+b'livox_tech\0\0\0\0\0\0'  # Signature (16 bytes)
+b'\x02\0\0\0'              # Version (2,0,0,0) - 4 bytes
+b'\x67\xA7\x0E\xAC'        # Magic Code (0xAC0EA767) - 4 bytes
+b'\x32\0\0\0'              # Frame Duration (50ms) - 4 bytes
+b'\x01'                    # Device Count (1) - 1 byte
+b'SN123456789012345\0'     # Lidar SN (16 bytes)
+b'HubSN123456789012\0'     # Hub SN (16 bytes)
+b'\0\0\0\0'                # Lidar ID (0) - 4 bytes
+b'\0'                      # Lidar Type (reserved) - 1 byte
+b'\x09'                    # Device Type (9 for Mid-360) - 1 byte
+b'\0'                      # Extrinsic Enable (0) - 1 byte
+b'\0\0\0\0' * 6             # Roll, Pitch, Yaw, X, Y, Z (float32, 6*4=24 bytes)
+# Frame 0
+b'\x74\0\0\0\0\0\0\0'      # Current Frame Offset (24+5+63 = 92 in decimal = 0x5C, but spec says this is absolute. Let's use 92 for now)
+b'\0\0\0\0\0\0\0\0'      # Next Frame Offset (0 for last frame) - 8 bytes
+b'\0\0\0\0\0\0\0\0'      # Frame Index (0) - 8 bytes
+# Package 0 for Lidar ID 0 in Frame 0
+b'\x01'                    # Package Version (1) - 1 byte
+b'\0\0\0\0'                # Lidar ID (0) - 4 bytes
+b'\0'                      # Reserved (was lidar_type_res) - 1 byte
+b'\0'                      # Timestamp Type (0 for nanoseconds) - 1 byte
+b'\0\0\0\0\0\0\0\0'        # Timestamp (8 bytes)
+b'\0\0'                    # UDP Counter (2 bytes)
+b'\x01'                    # Data Type (0x01 for int32 mm points) - 1 byte -> old spec, code uses H (2 bytes)
+b'\x0E\0\0\0'              # Point Data Length (14 bytes for 1 point) - 4 bytes -> old spec, code uses I (4 bytes)
+b'\0'                      # Frame Counter Reserved - 1 byte
+b'\0\0\0\0'                # Reserved - 4 bytes
+# Point Data (1 point)
+b'\xE8\x03\0\0'            # X: 1000 mm (int32)
+b'\xD0\x07\0\0'            # Y: 2000 mm (int32)
+b'\xF4\x01\0\0'            # Z: 500 mm (int32)
+b'\x50'                    # Intensity (80)
+b'\x01'                    # Tag (1)
