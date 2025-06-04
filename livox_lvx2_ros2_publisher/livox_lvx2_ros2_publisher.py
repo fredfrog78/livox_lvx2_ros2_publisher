@@ -152,11 +152,13 @@ class Lvx2ParserNode(Node):
                 self.get_logger().info(f"    Extrinsics (R,P,Y,X,Y,Z): {roll:.2f}deg, {pitch:.2f}deg, {yaw:.2f}deg, {x:.2f}m, {y:.2f}m, {z:.2f}m") # [cite: 42]
 
                 device_frame_id = f"{self.lidar_frame_id_prefix}{lidar_id}"
+                imu_frame_id = f"{device_frame_id}_imu"
                 self.device_infos_[lidar_id] = {
                     'sn': lidar_sn,
                     'frame_id': device_frame_id,
+                    'imu_frame_id': imu_frame_id, # Add this new key
                     'type': device_type,
-                    'roll_deg': roll, 'pitch_deg': pitch, 'yaw_deg': yaw, # Store for IMU
+                    'roll_deg': roll, 'pitch_deg': pitch, 'yaw_deg': yaw,
                     'extrinsic_enable': extrinsic_enable
                 }
 
@@ -183,6 +185,27 @@ class Lvx2ParserNode(Node):
                     t.transform.rotation.w = q[3]
                     self.static_broadcaster_.sendTransform(t)
                     self.get_logger().info(f"    Published static transform for {device_frame_id} relative to {self.base_frame_id}")
+
+                    # Create and broadcast the static transform for the IMU relative to the LiDAR
+                    t_imu = geometry_msgs.msg.TransformStamped()
+                    t_imu.header.stamp = self.get_clock().now().to_msg() # Use current time for static transform
+                    t_imu.header.frame_id = device_frame_id  # Parent is the LiDAR frame
+                    t_imu.child_frame_id = imu_frame_id   # Child is the new IMU frame
+
+                    # Set the translation based on the Livox Mid-360 User Manual (page 17)
+                    # x=11.0 mm, y=23.29 mm, z=-44.12 mm
+                    t_imu.transform.translation.x = 0.011
+                    t_imu.transform.translation.y = 0.02329
+                    t_imu.transform.translation.z = -0.04412
+
+                    # The IMU shares the same orientation as the LiDAR frame, so rotation is identity
+                    t_imu.transform.rotation.x = 0.0
+                    t_imu.transform.rotation.y = 0.0
+                    t_imu.transform.rotation.z = 0.0
+                    t_imu.transform.rotation.w = 1.0
+
+                    self.static_broadcaster_.sendTransform(t_imu)
+                    self.get_logger().info(f"    Published static transform for {imu_frame_id} relative to {device_frame_id}")
 
                     # Create IMU publisher
                     imu_topic_name = f"{self.imu_topic_prefix}{lidar_id}"
@@ -458,19 +481,16 @@ class Lvx2ParserNode(Node):
                     dev_info = self.device_infos_[lidar_id]
                     imu_msg = Imu()
                     imu_msg.header.stamp = ros_frame_publish_time
-                    imu_msg.header.frame_id = dev_info['frame_id']
+                    # Set the frame_id to the specific IMU frame
+                    imu_msg.header.frame_id = dev_info['imu_frame_id']
 
-                    q_orientation = self.euler_to_quaternion(
-                        math.radians(dev_info['roll_deg']),
-                        math.radians(dev_info['pitch_deg']),
-                        math.radians(dev_info['yaw_deg'])
-                    )
-                    imu_msg.orientation.x = q_orientation[0]
-                    imu_msg.orientation.y = q_orientation[1]
-                    imu_msg.orientation.z = q_orientation[2]
-                    imu_msg.orientation.w = q_orientation[3]
-                    # Small covariance for orientation if extrinsics are trusted
-                    imu_msg.orientation_covariance = [0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01]
+                    # Orientation is now provided by the TF tree, so set to identity and mark as unavailable.
+                    imu_msg.orientation.x = 0.0
+                    imu_msg.orientation.y = 0.0
+                    imu_msg.orientation.z = 0.0
+                    imu_msg.orientation.w = 1.0
+                    # Mark orientation covariance as unavailable, as it is defined by the static transform
+                    imu_msg.orientation_covariance = [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
                     # Angular velocity and linear acceleration are not in LVX2 file
                     imu_msg.angular_velocity.x = 0.0
