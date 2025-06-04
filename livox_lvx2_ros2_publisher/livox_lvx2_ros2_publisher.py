@@ -32,7 +32,7 @@ class Lvx2ParserNode(Node):
         self.declare_parameter('imu_topic_prefix', 'livox/imu_') # New parameter for IMU topics
         self.declare_parameter('base_frame_id', 'livox_base')
         self.declare_parameter('lidar_frame_id_prefix', 'livox_lidar_')
-        self.declare_parameter('use_original_timestamps', True)
+        self.declare_parameter('use_original_timestamps', False)
         self.declare_parameter('playback_rate_hz', 20.0) # Fallback if not using original timestamps
         self.declare_parameter('loop_playback', False)
 
