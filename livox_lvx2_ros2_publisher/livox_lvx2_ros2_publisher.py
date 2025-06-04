@@ -371,7 +371,7 @@ class Lvx2ParserNode(Node):
                         x_m_arr = points_array['x_mm'].astype(np.float32) / 1000.0
                         y_m_arr = points_array['y_mm'].astype(np.float32) / 1000.0
                         z_m_arr = points_array['z_mm'].astype(np.float32) / 1000.0
-                        intensity_arr = intensity_arr.astype(np.float32) / 255.0
+                        intensity_arr = points_array['intensity'].astype(np.float32)
                         tag_arr = points_array['tag']
                     elif data_type == 0x02:
                         # LVX2 Spec: x(short, cm), y(short, cm), z(short, cm), intensity(uchar), tag(uchar)
@@ -383,7 +383,7 @@ class Lvx2ParserNode(Node):
                         x_m_arr = points_array['x_cm'].astype(np.float32) / 100.0
                         y_m_arr = points_array['y_cm'].astype(np.float32) / 100.0
                         z_m_arr = points_array['z_cm'].astype(np.float32) / 100.0
-                        intensity_arr = intensity_arr.astype(np.float32) / 255.0
+                        intensity_arr = points_array['intensity'].astype(np.float32)
                         tag_arr = points_array['tag']
 
                     # This section replaces the old loop that used current_points_packed_list.append(struct.pack(...))
