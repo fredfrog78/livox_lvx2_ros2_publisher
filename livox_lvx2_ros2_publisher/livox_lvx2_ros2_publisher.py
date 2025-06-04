@@ -473,7 +473,6 @@ class Lvx2ParserNode(Node):
                 pc_msg.point_step = 14 # 3*4 + 1 + 1 bytes
                 pc_msg.row_step = pc_msg.point_step * num_total_points_for_lidar
                 pc_msg.data = all_points_bytes
-                self.get_logger().info(f"Publishing PointCloud2 with fields: {{pc_msg.fields}}")
                 self.publishers_[lidar_id].publish(pc_msg)
                 self.get_logger().debug(f"Published PointCloud2 for LiDAR {lidar_id} from frame {frame_idx} with {num_total_points_for_lidar} points.")
 
