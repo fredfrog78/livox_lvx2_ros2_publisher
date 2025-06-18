@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import PointCloud2, PointField, Imu
 from builtin_interfaces.msg import Time as RosTime
@@ -36,8 +37,16 @@ class Lvx2ParserNode(Node):
         self.declare_parameter('use_original_timestamps', False)
         self.declare_parameter('playback_rate_hz', 20.0) # Fallback if not using original timestamps
         self.declare_parameter('loop_playback', False)
-        self.declare_parameter('list_lidars', rclpy.Parameter.Type.BOOL, False)
-        self.declare_parameter('lidar_ids', rclpy.Parameter.Type.STRING, '')
+        self.declare_parameter('list_lidars',
+                               value=False,
+                               descriptor=ParameterDescriptor(
+                                   type=rclpy.Parameter.Type.BOOL,
+                                   description='Set to True to list LiDAR info and exit.'))
+        self.declare_parameter('lidar_ids',
+                               value='',
+                               descriptor=ParameterDescriptor(
+                                   type=rclpy.Parameter.Type.STRING,
+                                   description='Comma-separated list of LiDAR IDs to filter playback (e.g., "0,2"). Empty means all.'))
 
         # Get parameters
         self.lvx_file_path = self.get_parameter('lvx_file_path').get_parameter_value().string_value
