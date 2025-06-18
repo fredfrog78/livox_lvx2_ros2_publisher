@@ -461,11 +461,15 @@ class Lvx2ParserNode(Node):
                 package_read_pos += point_data_len
 
                 if lidar_id not in points_by_lidar_in_frame:
-                    points_by_lidar_in_frame[lidar_id] = {'points_bytes_list': [], 'representative_ts_ns': pkg_timestamp_ns, 'data_type': data_type}
+                    points_by_lidar_in_frame[lidar_id] = {
+                        'x_coords': [], 'y_coords': [], 'z_coords': [],
+                        'intensity_vals': [], 'tag_vals': [],
+                        'representative_ts_ns': pkg_timestamp_ns,
+                        'data_type': data_type
+                    }
                 elif points_by_lidar_in_frame[lidar_id]['data_type'] != data_type:
                      self.get_logger().warning(f"Frame {frame_idx}, LiDAR {lidar_id}: Mixed data types in packages. Using type {points_by_lidar_in_frame[lidar_id]['data_type']}.")
-                
-                # Removed: current_points_packed_list = points_by_lidar_in_frame[lidar_id]['points_bytes_list']
+
                 bytes_per_point_lvx = 0
                 if data_type == 0x01 or data_type == 0x00: bytes_per_point_lvx = 14 # [cite: 52]
                 elif data_type == 0x02: bytes_per_point_lvx = 8 # [cite: 52]
@@ -475,63 +479,32 @@ class Lvx2ParserNode(Node):
                 
                 num_points_in_package = point_data_len // bytes_per_point_lvx if bytes_per_point_lvx > 0 else 0
 
-                # Placeholder for the new NumPy arrays
-                x_m_arr = np.array([])
-                y_m_arr = np.array([])
-                z_m_arr = np.array([])
-                intensity_arr = np.array([])
-                tag_arr = np.array([])
-
+                current_lidar_data = points_by_lidar_in_frame[lidar_id]
                 if num_points_in_package > 0:
-                    if data_type == 0x01 or data_type == 0x00:
+                    if data_type == 0x01 or data_type == 0x00: # Cartesian Coordinate System with Timestamp; Point Data Type: x, y, z (int32, mm), reflectivity (uint8), tag (uint8)
                         # LVX2 Spec: x(int, mm), y(int, mm), z(int, mm), intensity(uchar), tag(uchar)
                         dtype_mm = np.dtype([
                             ('x_mm', '<i4'), ('y_mm', '<i4'), ('z_mm', '<i4'),
                             ('intensity', 'u1'), ('tag', 'u1')
                         ])
                         points_array = np.frombuffer(raw_points_data, dtype=dtype_mm, count=num_points_in_package)
-                        x_m_arr = points_array['x_mm'].astype(np.float32) / 1000.0
-                        y_m_arr = points_array['y_mm'].astype(np.float32) / 1000.0
-                        z_m_arr = points_array['z_mm'].astype(np.float32) / 1000.0
-                        intensity_arr = points_array['intensity'].astype(np.float32)
-                        tag_arr = points_array['tag']
-                    elif data_type == 0x02:
+                        current_lidar_data['x_coords'].extend((points_array['x_mm'].astype(np.float32) / 1000.0).tolist())
+                        current_lidar_data['y_coords'].extend((points_array['y_mm'].astype(np.float32) / 1000.0).tolist())
+                        current_lidar_data['z_coords'].extend((points_array['z_mm'].astype(np.float32) / 1000.0).tolist())
+                        current_lidar_data['intensity_vals'].extend(points_array['intensity'].astype(np.float32).tolist())
+                        current_lidar_data['tag_vals'].extend(points_array['tag'].tolist())
+                    elif data_type == 0x02: # Spherical Coordinate System; Point Data Type: depth (int32), theta (uint16), phi (uint16), reflectivity (uint8), tag (uint8) -> This is incorrect, data_type 0x02 is Cartesian Short
                         # LVX2 Spec: x(short, cm), y(short, cm), z(short, cm), intensity(uchar), tag(uchar)
                         dtype_cm = np.dtype([
                             ('x_cm', '<h'), ('y_cm', '<h'), ('z_cm', '<h'),
                             ('intensity', 'u1'), ('tag', 'u1')
                         ])
                         points_array = np.frombuffer(raw_points_data, dtype=dtype_cm, count=num_points_in_package)
-                        x_m_arr = points_array['x_cm'].astype(np.float32) / 100.0
-                        y_m_arr = points_array['y_cm'].astype(np.float32) / 100.0
-                        z_m_arr = points_array['z_cm'].astype(np.float32) / 100.0
-                        intensity_arr = points_array['intensity'].astype(np.float32)
-                        tag_arr = points_array['tag']
-
-                    # This section replaces the old loop that used current_points_packed_list.append(struct.pack(...))
-                    # Define the dtype for the output PointCloud2 structure for these fields
-                    dtype_pointcloud_point = np.dtype([
-                        ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
-                        ('intensity', '<f4'), ('tag', 'u1')
-                    ])
-                    # Create an empty structured array for the output points
-                    packed_points_arr = np.empty(num_points_in_package, dtype=dtype_pointcloud_point)
-
-                    # Populate the structured array
-                    packed_points_arr['x'] = x_m_arr
-                    packed_points_arr['y'] = y_m_arr
-                    packed_points_arr['z'] = z_m_arr
-                    packed_points_arr['intensity'] = intensity_arr
-                    packed_points_arr['tag'] = tag_arr
-
-                    # Convert the structured NumPy array to a byte string
-                    package_points_bytes = packed_points_arr.tobytes()
-
-                    # Append this package's byte string to the list for the current lidar_id
-                    # This assumes points_by_lidar_in_frame[lidar_id]['points_bytes_list'] is initialized as a list
-                    points_by_lidar_in_frame[lidar_id]['points_bytes_list'].append(package_points_bytes)
-                # If num_points_in_package was 0, x_m_arr etc. would be empty,
-                # and no bytes are added for this package, which is correct.
+                        current_lidar_data['x_coords'].extend((points_array['x_cm'].astype(np.float32) / 100.0).tolist())
+                        current_lidar_data['y_coords'].extend((points_array['y_cm'].astype(np.float32) / 100.0).tolist())
+                        current_lidar_data['z_coords'].extend((points_array['z_cm'].astype(np.float32) / 100.0).tolist())
+                        current_lidar_data['intensity_vals'].extend(points_array['intensity'].astype(np.float32).tolist())
+                        current_lidar_data['tag_vals'].extend(points_array['tag'].tolist())
 
 
             # Determine the timestamp for publishing messages for THIS frame
@@ -578,18 +551,30 @@ class Lvx2ParserNode(Node):
             time_system_at_start_of_prev_frame_publish_cycle_ns = self.get_clock().now().nanoseconds
             ros_frame_publish_time = livox_ts_to_ros_time(frame_publication_ts_ns_for_header)
 
-            # After all packages for this frame are read, publish PointCloud2 and IMU messages
+            # After all packages for this frame are read, process and then publish PointCloud2 and IMU messages
             for lidar_id, collected_data in points_by_lidar_in_frame.items():
                 if self.selected_lidar_ids and lidar_id not in self.selected_lidar_ids:
                     self.get_logger().debug(f"Skipping LiDAR ID {lidar_id} as it's not in the selected list for frame {frame_idx}.")
-                    continue # Skip to the next LiDAR ID in the frame
-
-                if not collected_data['points_bytes_list']:
                     continue
 
-                all_points_bytes = b''.join(collected_data['points_bytes_list'])
-                # Each packed point is: x(f4), y(f4), z(f4), intensity(f4), tag(u1) = 4+4+4+4+1 = 17 bytes
-                num_total_points_for_lidar = len(all_points_bytes) // 17
+                num_total_points_for_lidar = len(collected_data['x_coords'])
+                if num_total_points_for_lidar == 0:
+                    continue
+
+                # Create a single NumPy structured array from the collected lists
+                dtype_pointcloud_point = np.dtype([
+                    ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                    ('intensity', '<f4'), ('tag', 'u1')
+                ])
+                final_points_array = np.empty(num_total_points_for_lidar, dtype=dtype_pointcloud_point)
+                final_points_array['x'] = collected_data['x_coords']
+                final_points_array['y'] = collected_data['y_coords']
+                final_points_array['z'] = collected_data['z_coords']
+                final_points_array['intensity'] = collected_data['intensity_vals']
+                final_points_array['tag'] = collected_data['tag_vals']
+
+                all_points_bytes = final_points_array.tobytes()
+                collected_data['all_points_bytes'] = all_points_bytes # Store for publishing
 
                 if lidar_id not in self.publishers_:
                     self.get_logger().warning(f"Frame {frame_idx}: LiDAR ID {lidar_id} has data but no PointCloud2 publisher. Skipping.")
@@ -611,7 +596,7 @@ class Lvx2ParserNode(Node):
                 ]
                 pc_msg.point_step = 17 # 3*4 + 4 + 1 bytes
                 pc_msg.row_step = pc_msg.point_step * num_total_points_for_lidar
-                pc_msg.data = all_points_bytes
+                pc_msg.data = collected_data['all_points_bytes'] # Use the newly created bytes
                 self.publishers_[lidar_id].publish(pc_msg)
                 self.get_logger().debug(f"Published PointCloud2 for LiDAR {lidar_id} from frame {frame_idx} with {num_total_points_for_lidar} points.")
 
