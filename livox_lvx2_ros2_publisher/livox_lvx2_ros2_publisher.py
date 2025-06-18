@@ -265,15 +265,31 @@ class Lvx2ParserNode(Node):
                 self.get_logger().info(f"    Extrinsics (R,P,Y,X,Y,Z): {roll:.2f}deg, {pitch:.2f}deg, {yaw:.2f}deg, {x:.2f}m, {y:.2f}m, {z:.2f}m") # [cite: 42]
 
                 device_frame_id = f"{self.lidar_frame_id_prefix}{lidar_id}"
-                imu_frame_id = f"{device_frame_id}_imu"
-                self.device_infos_[lidar_id] = {
+                imu_frame_id = f"{self.lidar_frame_id_prefix}{lidar_id}_imu" # Consistent frame ID naming
+
+                current_device_info = {
                     'sn': lidar_sn,
+                    'hub_sn': hub_sn,
                     'frame_id': device_frame_id,
-                    'imu_frame_id': imu_frame_id, # Add this new key
-                    'type': device_type,
-                    'roll_deg': roll, 'pitch_deg': pitch, 'yaw_deg': yaw,
+                    'imu_frame_id': imu_frame_id,
+                    'type': device_type, # Store original type code
                     'extrinsic_enable': extrinsic_enable
                 }
+                if extrinsic_enable == 1:
+                    current_device_info.update({
+                        'roll_deg': roll,
+                        'pitch_deg': pitch,
+                        'yaw_deg': yaw,
+                        'x': x, 'y': y, 'z': z
+                    })
+                self.device_infos_[lidar_id] = current_device_info
+
+                # Conditional creation based on selected_lidar_ids
+                if self.selected_lidar_ids and lidar_id not in self.selected_lidar_ids:
+                    self.get_logger().info(f"    LiDAR ID {lidar_id} (SN: {lidar_sn}) is filtered out by lidar_ids parameter. Skipping ROS resource creation (publishers, TF).")
+                    continue # Skip to the next device in the loop
+
+                self.get_logger().info(f"    LiDAR ID {lidar_id} (SN: {lidar_sn}) is selected. Creating publishers and TF.")
 
                 # Create PointCloud2 publisher
                 pc_topic_name = f"{self.pc_topic_prefix}{lidar_id}"
@@ -285,28 +301,34 @@ class Lvx2ParserNode(Node):
                     t = geometry_msgs.msg.TransformStamped()
                     t.header.stamp = self.get_clock().now().to_msg() # TF is timeless but StaticBroadcaster needs a stamp
                     t.header.frame_id = self.base_frame_id
-                    t.child_frame_id = device_frame_id
+                    # Use frame_id from current_device_info for consistency, though it's same as local device_frame_id here
+                    t.child_frame_id = current_device_info['frame_id']
 
-                    t.transform.translation.x = float(x)
-                    t.transform.translation.y = float(y)
-                    t.transform.translation.z = float(z)
+                    t.transform.translation.x = float(current_device_info['x'])
+                    t.transform.translation.y = float(current_device_info['y'])
+                    t.transform.translation.z = float(current_device_info['z'])
 
-                    q = self.euler_to_quaternion(math.radians(roll), math.radians(pitch), math.radians(yaw))
+                    q = self.euler_to_quaternion(math.radians(current_device_info['roll_deg']),
+                                                 math.radians(current_device_info['pitch_deg']),
+                                                 math.radians(current_device_info['yaw_deg']))
                     t.transform.rotation.x = q[0]
                     t.transform.rotation.y = q[1]
                     t.transform.rotation.z = q[2]
                     t.transform.rotation.w = q[3]
                     self.static_broadcaster_.sendTransform(t)
-                    self.get_logger().info(f"    Published static transform for {device_frame_id} relative to {self.base_frame_id}")
+                    self.get_logger().info(f"    Published static transform for {current_device_info['frame_id']} relative to {self.base_frame_id}")
 
                     # Create and broadcast the static transform for the IMU relative to the LiDAR
                     t_imu = geometry_msgs.msg.TransformStamped()
                     t_imu.header.stamp = self.get_clock().now().to_msg() # Use current time for static transform
-                    t_imu.header.frame_id = device_frame_id  # Parent is the LiDAR frame
-                    t_imu.child_frame_id = imu_frame_id   # Child is the new IMU frame
+                    t_imu.header.frame_id = current_device_info['frame_id']  # Parent is the LiDAR frame
+                    t_imu.child_frame_id = current_device_info['imu_frame_id']   # Child is the new IMU frame
 
-                    # Set the translation based on the Livox Mid-360 User Manual (page 17)
-                    # x=11.0 mm, y=23.29 mm, z=-44.12 mm
+                    # Set the translation based on the Livox Mid-360 User Manual (page 17) for Mid-360
+                    # For other LiDARs, these values might be different or (0,0,0) if IMU is co-located.
+                    # This example uses Mid-360 values. A more robust solution might involve
+                    # device_type specific offsets or reading them from a config if they vary.
+                    # For now, assuming these are generally applicable or a placeholder.
                     t_imu.transform.translation.x = 0.011
                     t_imu.transform.translation.y = 0.02329
                     t_imu.transform.translation.z = -0.04412
@@ -318,7 +340,7 @@ class Lvx2ParserNode(Node):
                     t_imu.transform.rotation.w = 1.0
 
                     self.static_broadcaster_.sendTransform(t_imu)
-                    self.get_logger().info(f"    Published static transform for {imu_frame_id} relative to {device_frame_id}")
+                    self.get_logger().info(f"    Published static transform for {current_device_info['imu_frame_id']} relative to {current_device_info['frame_id']}")
 
                     # Create IMU publisher
                     imu_topic_name = f"{self.imu_topic_prefix}{lidar_id}"
