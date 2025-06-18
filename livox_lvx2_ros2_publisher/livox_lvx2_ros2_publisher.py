@@ -75,18 +75,18 @@ class Lvx2ParserNode(Node):
         try:
             with open(self.lvx_file_path, 'rb') as f:
                 if not self._parse_public_header(f):
-                    self.get_logger().error("Failed to parse public header for listing.")
-                    return False # Indicate failure
+                    self.get_logger().error("Failed to parse public header for listing. Aborting list.")
+                    return # This will lead to the finally block
                 if not self._parse_private_header(f):
-                    self.get_logger().error("Failed to parse private header for listing.")
-                    return False # Indicate failure
+                    self.get_logger().error("Failed to parse private header for listing. Aborting list.")
+                    return # This will lead to the finally block
 
-                self.get_logger().info("Device Information:")
+                self.get_logger().info("Device Information (from list_lidar_info):") # Clarify log source
                 for i in range(self.device_count):
                     dev_info_data = f.read(63)
                     if len(dev_info_data) < 63:
                         self.get_logger().error(f"Device Info {i}: Unexpected EOF while listing. Expected 63 bytes, got {len(dev_info_data)}.")
-                        return False # Indicate failure
+                        return # This will lead to the finally block
 
                     lidar_sn_bytes, hub_sn_bytes, lidar_id, lidar_type_reserved, device_type, \
                     extrinsic_enable, roll, pitch, yaw, x, y, z = \
@@ -108,38 +108,20 @@ class Lvx2ParserNode(Node):
                     print(f"    Extrinsics Enabled: {'Yes' if extrinsic_enable == 1 else 'No'}")
                     if extrinsic_enable == 1:
                         print(f"    Extrinsics (Roll, Pitch, Yaw, X, Y, Z): {roll:.2f}deg, {pitch:.2f}deg, {yaw:.2f}deg, {x:.2f}m, {y:.2f}m, {z:.2f}m")
-
+            self.get_logger().info("LiDAR information listing processing complete.") # New log message
         except FileNotFoundError:
             self.get_logger().error(f"LVX file not found for listing: {self.lvx_file_path}")
-            return False # Indicate failure
         except Exception as e:
             self.get_logger().error(f"An error occurred during LiDAR information listing: {e}")
             import traceback
             self.get_logger().error(traceback.format_exc())
-            return False # Indicate failure
-
-        self.get_logger().info("LiDAR information listing complete.")
-        return True # Indicate success at the end of successful listing
+        finally:
+            self.get_logger().info("Initiating shutdown after listing LiDARs.") # Changed log message
+            self._initiate_shutdown() # Ensure shutdown happens here
 
     def start_processing_once(self):
         if self.timer:
             self.timer.cancel() # Ensure this runs only once
-
-        if self.list_lidars:
-            if not self.lvx_file_path or not os.path.exists(self.lvx_file_path):
-                self.get_logger().error(f"LVX file path is invalid or file does not exist: {self.lvx_file_path} for listing.")
-                # Schedule shutdown if file is bad, as the node might be spun by main()
-                self.create_timer(0.1, lambda: self._initiate_shutdown())
-                return
-
-            listing_success = self.list_lidar_info() # Capture success/failure
-
-            # Schedule shutdown regardless of success or failure of listing, as the goal was to list and exit.
-            # This allows print statements to flush and ROS to process the shutdown cleanly.
-            self.get_logger().info("Scheduling shutdown after listing LiDARs.")
-            self.create_timer(0.1, lambda: self._initiate_shutdown())
-            return # Prevent further processing (i.e., process_lvx_file)
-
         self.process_lvx_file()
 
 
@@ -599,6 +581,15 @@ class Lvx2ParserNode(Node):
 
 
     def process_lvx_file(self):
+        if self.list_lidars:
+            if not self.lvx_file_path or not os.path.exists(self.lvx_file_path):
+                self.get_logger().error(f"LVX file path is invalid or file does not exist: {self.lvx_file_path} for listing.")
+                # Schedule a timer for shutdown to allow logger to flush if called from main spin
+                self.create_timer(0.1, lambda: self._initiate_shutdown())
+                return
+            self.list_lidar_info() # This method will now handle its own shutdown
+            return # Prevent further execution of process_lvx_file
+
         try:
             with open(self.lvx_file_path, 'rb') as f:
                 if not self._parse_public_header(f): return
