@@ -42,10 +42,7 @@ class Lvx2ParserNode(Node):
                                descriptor=ParameterDescriptor(
                                    type=rclpy.Parameter.Type.BOOL,
                                    description='Set to True to list LiDAR info and exit.'))
-        self.declare_parameter('lidar_ids',
-                               '',  # Default value, type will be inferred as STRING
-                               ParameterDescriptor(
-                                   description='Comma-separated list of LiDAR IDs to filter playback (e.g., "0,2"). Empty means all.'))
+        self.declare_parameter('lidar_ids', '') # Type inferred as STRING from default value
 
         # Get parameters
         self.lvx_file_path = self.get_parameter('lvx_file_path').get_parameter_value().string_value
