@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from rcl_interfaces.msg import ParameterDescriptor
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import PointCloud2, PointField, Imu
 from builtin_interfaces.msg import Time as RosTime
@@ -59,41 +59,47 @@ class Lvx2ParserNode(Node):
         self.loop_playback = self.get_parameter('loop_playback').get_parameter_value().bool_value
         self.list_lidars = self.get_parameter('list_lidars').get_parameter_value().bool_value
 
-        # Get the lidar_ids parameter value
-        raw_lidar_ids_param = self.get_parameter('lidar_ids').get_parameter_value()
+        # Get the lidar_ids parameter (which will be a ParameterValue object due to dynamic_typing)
+        param_value_msg = self.get_parameter('lidar_ids').get_parameter_value()
 
-        # Ensure lidar_ids_str is a string for consistent processing
-        if isinstance(raw_lidar_ids_param, int):
-            self.lidar_ids_str = str(raw_lidar_ids_param)
-            self.get_logger().info(f"Received lidar_ids as integer: {raw_lidar_ids_param}, converted to string: '{self.lidar_ids_str}'")
-        elif isinstance(raw_lidar_ids_param, str):
-            self.lidar_ids_str = raw_lidar_ids_param
+        self.lidar_ids_str = '' # Default to empty string
+
+        if param_value_msg.type == ParameterType.PARAMETER_STRING:
+            self.lidar_ids_str = param_value_msg.string_value
+            self.get_logger().info(f"Received lidar_ids as string: '{self.lidar_ids_str}'")
+        elif param_value_msg.type == ParameterType.PARAMETER_INTEGER:
+            # This case handles when a single numeric ID is passed and gets coerced to an integer
+            # by the parameter system before rclpy receives it.
+            self.lidar_ids_str = str(param_value_msg.integer_value)
+            self.get_logger().info(f"Received lidar_ids as integer: {param_value_msg.integer_value}, converted to string: '{self.lidar_ids_str}'")
+        elif param_value_msg.type == ParameterType.PARAMETER_NOT_SET and param_value_msg.string_value == '':
+            # This handles the default case where the parameter is not set and defaults to empty string
+            self.get_logger().info("lidar_ids parameter not set or empty, no filtering will be applied.")
+            self.lidar_ids_str = '' # Explicitly ensure it's an empty string
         else:
-            # This case should ideally not be reached if dynamic_typing works as expected for string/int
-            self.get_logger().warning(f"Unexpected type for lidar_ids parameter: {type(raw_lidar_ids_param)}. Defaulting to empty string.")
+            self.get_logger().warning(
+                f"lidar_ids parameter has unexpected type ({param_value_msg.type}) or value. "
+                f"String: '{param_value_msg.string_value}', Int: {param_value_msg.integer_value}. "
+                f"Defaulting to no filtering."
+            )
             self.lidar_ids_str = ''
 
+        # The rest of the parsing logic for self.lidar_ids_str into self.selected_lidar_ids remains the same:
         self.selected_lidar_ids = []
         if self.lidar_ids_str:
             try:
-                # Process the string: remove trailing commas first, then split.
-                # This handles cases like "123," (user workaround) or just "123" or "123,456"
                 processed_ids_str = self.lidar_ids_str.strip().rstrip(',')
-
-                if processed_ids_str: # Ensure not empty after stripping
+                if processed_ids_str:
                     self.selected_lidar_ids = [int(id_str.strip()) for id_str in processed_ids_str.split(',') if id_str.strip()]
-                    if self.selected_lidar_ids: # Log only if IDs were actually parsed
+                    if self.selected_lidar_ids:
                         self.get_logger().info(f"Playback will be filtered for LiDAR IDs: {self.selected_lidar_ids}")
-                    elif self.lidar_ids_str: # Original string was not empty but parsing resulted in no IDs
+                    elif self.lidar_ids_str:
                         self.get_logger().info(f"Lidar IDs string '{self.lidar_ids_str}' resulted in no valid IDs for filtering; no filtering applied.")
-                elif self.lidar_ids_str: # Original string was not empty but became empty after stripping (e.g. was just a comma)
+                elif self.lidar_ids_str:
                      self.get_logger().info(f"Lidar IDs string '{self.lidar_ids_str}' became empty after processing; no filtering applied.")
-                # If self.lidar_ids_str was initially empty, no message is logged here, which is fine.
-
             except ValueError:
                 self.get_logger().error(f"Invalid format for lidar_ids string: '{self.lidar_ids_str}' after processing. Please use comma-separated integers. Disabling filtering.")
-                self.selected_lidar_ids = [] # Disable filtering on error
-        # No specific log if lidar_ids_str was empty from the start and no filtering is applied.
+                self.selected_lidar_ids = []
 
         self.publishers_ = {}  # Dict to store PointCloud2 publishers: {lidar_id: publisher}
         self.imu_publishers_ = {} # Dict to store IMU publishers: {lidar_id: publisher}
