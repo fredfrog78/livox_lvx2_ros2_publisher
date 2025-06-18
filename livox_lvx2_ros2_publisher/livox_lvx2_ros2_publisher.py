@@ -60,11 +60,6 @@ class Lvx2ParserNode(Node):
                 self.get_logger().error(f"Invalid format for lidar_ids: '{self.lidar_ids_str}'. Please use comma-separated integers. Disabling filtering.")
                 self.selected_lidar_ids = [] # Disable filtering on error
 
-        if not self.lvx_file_path or not os.path.exists(self.lvx_file_path):
-            self.get_logger().error(f"LVX file path is invalid or file does not exist: {self.lvx_file_path}")
-            #rclpy.shutdown() # Avoid shutting down here if used as a library
-            return
-
         self.publishers_ = {}  # Dict to store PointCloud2 publishers: {lidar_id: publisher}
         self.imu_publishers_ = {} # Dict to store IMU publishers: {lidar_id: publisher}
         self.device_infos_ = {} # Dict to store device specific info: {lidar_id: info}
@@ -81,19 +76,17 @@ class Lvx2ParserNode(Node):
             with open(self.lvx_file_path, 'rb') as f:
                 if not self._parse_public_header(f):
                     self.get_logger().error("Failed to parse public header for listing.")
-                    self._initiate_shutdown()
-                    return
+                    return False # Indicate failure
                 if not self._parse_private_header(f):
                     self.get_logger().error("Failed to parse private header for listing.")
-                    self._initiate_shutdown()
-                    return
+                    return False # Indicate failure
 
                 self.get_logger().info("Device Information:")
                 for i in range(self.device_count):
                     dev_info_data = f.read(63)
                     if len(dev_info_data) < 63:
                         self.get_logger().error(f"Device Info {i}: Unexpected EOF while listing. Expected 63 bytes, got {len(dev_info_data)}.")
-                        break
+                        return False # Indicate failure
 
                     lidar_sn_bytes, hub_sn_bytes, lidar_id, lidar_type_reserved, device_type, \
                     extrinsic_enable, roll, pitch, yaw, x, y, z = \
@@ -118,13 +111,15 @@ class Lvx2ParserNode(Node):
 
         except FileNotFoundError:
             self.get_logger().error(f"LVX file not found for listing: {self.lvx_file_path}")
+            return False # Indicate failure
         except Exception as e:
             self.get_logger().error(f"An error occurred during LiDAR information listing: {e}")
             import traceback
             self.get_logger().error(traceback.format_exc())
-        finally:
-            self.get_logger().info("LiDAR information listing complete.")
-            self._initiate_shutdown()
+            return False # Indicate failure
+
+        self.get_logger().info("LiDAR information listing complete.")
+        return True # Indicate success at the end of successful listing
 
     def start_processing_once(self):
         if self.timer:
@@ -133,10 +128,17 @@ class Lvx2ParserNode(Node):
         if self.list_lidars:
             if not self.lvx_file_path or not os.path.exists(self.lvx_file_path):
                 self.get_logger().error(f"LVX file path is invalid or file does not exist: {self.lvx_file_path} for listing.")
-                self._initiate_shutdown() # Ensure shutdown if file is bad
+                # Schedule shutdown if file is bad, as the node might be spun by main()
+                self.create_timer(0.1, lambda: self._initiate_shutdown())
                 return
-            self.list_lidar_info()
-            return # Prevent further processing if listing is done
+
+            listing_success = self.list_lidar_info() # Capture success/failure
+
+            # Schedule shutdown regardless of success or failure of listing, as the goal was to list and exit.
+            # This allows print statements to flush and ROS to process the shutdown cleanly.
+            self.get_logger().info("Scheduling shutdown after listing LiDARs.")
+            self.create_timer(0.1, lambda: self._initiate_shutdown())
+            return # Prevent further processing (i.e., process_lvx_file)
 
         self.process_lvx_file()
 

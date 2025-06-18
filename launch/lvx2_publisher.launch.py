@@ -45,6 +45,16 @@ def generate_launch_description():
             default_value='False',
             description='Loop LVX file playback if True. (bool)'
         ),
+        DeclareLaunchArgument(
+            'list_lidars',
+            default_value='False',
+            description='Set to True to list LiDAR info and exit.'
+        ),
+        DeclareLaunchArgument(
+            'lidar_ids',
+            default_value='',
+            description='Comma-separated list of LiDAR IDs to filter playback (e.g., "0,2"). Empty means all.'
+        ),
 
         Node(
             package='livox_lvx2_ros2_publisher',
@@ -60,6 +70,8 @@ def generate_launch_description():
                 'use_original_timestamps': LaunchConfiguration('use_original_timestamps'),
                 'playback_rate_hz': LaunchConfiguration('playback_rate_hz'),
                 'loop_playback': LaunchConfiguration('loop_playback'),
+                'list_lidars': LaunchConfiguration('list_lidars'),
+                'lidar_ids': LaunchConfiguration('lidar_ids'),
             }]
         )
     ])
