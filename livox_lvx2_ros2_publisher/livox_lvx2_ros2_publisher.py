@@ -36,6 +36,8 @@ class Lvx2ParserNode(Node):
         self.declare_parameter('use_original_timestamps', False)
         self.declare_parameter('playback_rate_hz', 20.0) # Fallback if not using original timestamps
         self.declare_parameter('loop_playback', False)
+        self.declare_parameter('list_lidars', rclpy.Parameter.Type.BOOL, False)
+        self.declare_parameter('lidar_ids', rclpy.Parameter.Type.STRING, '')
 
         # Get parameters
         self.lvx_file_path = self.get_parameter('lvx_file_path').get_parameter_value().string_value
@@ -46,6 +48,17 @@ class Lvx2ParserNode(Node):
         self.use_original_timestamps = self.get_parameter('use_original_timestamps').get_parameter_value().bool_value
         self.playback_rate_hz = self.get_parameter('playback_rate_hz').get_parameter_value().double_value
         self.loop_playback = self.get_parameter('loop_playback').get_parameter_value().bool_value
+        self.list_lidars = self.get_parameter('list_lidars').get_parameter_value().bool_value
+        self.lidar_ids_str = self.get_parameter('lidar_ids').get_parameter_value().string_value
+
+        self.selected_lidar_ids = []
+        if self.lidar_ids_str:
+            try:
+                self.selected_lidar_ids = [int(id_str.strip()) for id_str in self.lidar_ids_str.split(',')]
+                self.get_logger().info(f"Playback will be filtered for LiDAR IDs: {self.selected_lidar_ids}")
+            except ValueError:
+                self.get_logger().error(f"Invalid format for lidar_ids: '{self.lidar_ids_str}'. Please use comma-separated integers. Disabling filtering.")
+                self.selected_lidar_ids = [] # Disable filtering on error
 
         if not self.lvx_file_path or not os.path.exists(self.lvx_file_path):
             self.get_logger().error(f"LVX file path is invalid or file does not exist: {self.lvx_file_path}")
@@ -62,10 +75,69 @@ class Lvx2ParserNode(Node):
         # Defer processing to a separate method or timer to allow __init__ to complete
         self.timer = self.create_timer(0.01, self.start_processing_once)
 
+    def list_lidar_info(self):
+        self.get_logger().info("Listing LiDAR information...")
+        try:
+            with open(self.lvx_file_path, 'rb') as f:
+                if not self._parse_public_header(f):
+                    self.get_logger().error("Failed to parse public header for listing.")
+                    self._initiate_shutdown()
+                    return
+                if not self._parse_private_header(f):
+                    self.get_logger().error("Failed to parse private header for listing.")
+                    self._initiate_shutdown()
+                    return
+
+                self.get_logger().info("Device Information:")
+                for i in range(self.device_count):
+                    dev_info_data = f.read(63)
+                    if len(dev_info_data) < 63:
+                        self.get_logger().error(f"Device Info {i}: Unexpected EOF while listing. Expected 63 bytes, got {len(dev_info_data)}.")
+                        break
+
+                    lidar_sn_bytes, hub_sn_bytes, lidar_id, lidar_type_reserved, device_type, \
+                    extrinsic_enable, roll, pitch, yaw, x, y, z = \
+                    struct.unpack('<16s16sIBBBffffff', dev_info_data)
+
+                    lidar_sn = lidar_sn_bytes.split(b'\0',1)[0].decode('ascii', errors='ignore')
+                    hub_sn = hub_sn_bytes.split(b'\0',1)[0].decode('ascii', errors='ignore')
+
+                    # Use print for direct console output for this CLI-like feature
+                    print(f"  LIDAR ID: {lidar_id}")
+                    print(f"    SN: {lidar_sn}")
+                    if hub_sn:
+                        print(f"    Hub SN: {hub_sn}")
+                    print(f"    Device Type: {device_type}")
+                    # LVX2 device type enum can be added here for more clarity if available
+                    # e.g. MID360:9, HAP:10
+                    device_type_map = {0: "HAP (TX)", 1: "MID40", 2: "TELE", 3: "AVIA", 6: "MID70", 9: "MID360", 10: "HAP (RX)"} # Example mapping
+                    print(f"    Device Type Name: {device_type_map.get(device_type, 'Unknown')}")
+                    print(f"    Extrinsics Enabled: {'Yes' if extrinsic_enable == 1 else 'No'}")
+                    if extrinsic_enable == 1:
+                        print(f"    Extrinsics (Roll, Pitch, Yaw, X, Y, Z): {roll:.2f}deg, {pitch:.2f}deg, {yaw:.2f}deg, {x:.2f}m, {y:.2f}m, {z:.2f}m")
+
+        except FileNotFoundError:
+            self.get_logger().error(f"LVX file not found for listing: {self.lvx_file_path}")
+        except Exception as e:
+            self.get_logger().error(f"An error occurred during LiDAR information listing: {e}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+        finally:
+            self.get_logger().info("LiDAR information listing complete.")
+            self._initiate_shutdown()
 
     def start_processing_once(self):
         if self.timer:
             self.timer.cancel() # Ensure this runs only once
+
+        if self.list_lidars:
+            if not self.lvx_file_path or not os.path.exists(self.lvx_file_path):
+                self.get_logger().error(f"LVX file path is invalid or file does not exist: {self.lvx_file_path} for listing.")
+                self._initiate_shutdown() # Ensure shutdown if file is bad
+                return
+            self.list_lidar_info()
+            return # Prevent further processing if listing is done
+
         self.process_lvx_file()
 
 
@@ -446,6 +518,10 @@ class Lvx2ParserNode(Node):
 
             # After all packages for this frame are read, publish PointCloud2 and IMU messages
             for lidar_id, collected_data in points_by_lidar_in_frame.items():
+                if self.selected_lidar_ids and lidar_id not in self.selected_lidar_ids:
+                    self.get_logger().debug(f"Skipping LiDAR ID {lidar_id} as it's not in the selected list for frame {frame_idx}.")
+                    continue # Skip to the next LiDAR ID in the frame
+
                 if not collected_data['points_bytes_list']:
                     continue
 

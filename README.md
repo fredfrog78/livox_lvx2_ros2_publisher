@@ -58,6 +58,16 @@ The following launch arguments are available and are passed as parameters to the
 - `use_original_timestamps` (bool, default: `'True'`): If `True`, the node attempts to use timestamps from the LVX file and replay data at the original recorded speed. If `False`, it uses the `playback_rate_hz` parameter.
 - `playback_rate_hz` (double, default: `'20.0'`): The rate (in Hz) at which to publish messages if `use_original_timestamps` is set to `False`.
 - `loop_playback` (bool, default: `'False'`): If `True`, the LVX file playback will loop continuously.
+- `list_lidars` (bool, default: `'False'`): If `True`, the node will parse the LVX file to find all LiDAR devices, print their information (Serial Number, Lidar ID, Device Type, Extrinsic Parameters), and then exit without replaying point cloud data. This is useful for inspecting the contents of an LVX file.
+  Example:
+  ```bash
+  ros2 run livox_lvx2_ros2_publisher livox_lvx2_ros2_publisher --ros-args -p lvx_file_path:="/path/to/your/file.lvx2" -p list_lidars:=True
+  ```
+- `lidar_ids` (string, default: `''`): A comma-separated list of Lidar IDs (integers) to filter playback. If provided, only data from the specified LiDAR IDs will be published. If empty or omitted, data from all LiDARs in the file will be published.
+  Example (publish data only from LiDARs with ID 0 and ID 2):
+  ```bash
+  ros2 run livox_lvx2_ros2_publisher livox_lvx2_ros2_publisher --ros-args -p lvx_file_path:="/path/to/your/file.lvx2" -p lidar_ids:="0,2"
+  ```
 
 ## Maintainer Information
 The maintainer listed in the `package.xml` is `ROS Developer <rosdeveloper@example.com>`. If you fork or adapt this package for your own use, you may want to update this information in your version of the `package.xml` file.
