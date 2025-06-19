@@ -106,6 +106,7 @@ class Lvx2ParserNode(Node):
         self.device_infos_ = {} # Dict to store device specific info: {lidar_id: info}
         self.static_broadcaster_ = StaticTransformBroadcaster(self)
         self.device_frame_duration_ms = 50 # Default, will be updated from private header [cite: 31]
+        self.last_timestamp_ns_per_lidar = {} # For per-LiDAR non-monotonic checks
 
         self.get_logger().info("LVX2 Parser Node started. Processing file...")
         # Defer processing to a separate method or timer to allow __init__ to complete
@@ -379,11 +380,14 @@ class Lvx2ParserNode(Node):
 
         frame_count_overall = 0
         previous_frame_original_ts_for_delay_calc_ns = None
-        # System time reference for precise delay calculation
-        time_system_at_start_of_prev_frame_publish_cycle_ns = self.get_clock().now().nanoseconds
-
+        # Removed: time_system_at_start_of_prev_frame_publish_cycle_ns
+        # This will be replaced by current_cycle_start_time_ns for calculating processing time of the current cycle.
 
         while rclpy.ok():
+            current_cycle_start_time_ns = self.get_clock().now().nanoseconds # For overall cycle time measurement
+            frame_processing_start_time_ns = current_cycle_start_time_ns # Specifically for package reading part
+
+            any_lidar_had_timestamp_issue_this_frame = False # Initialize for the current frame
             f.seek(current_frame_offset_in_file)
             frame_header_data = f.read(24) # [cite: 47] Frame Header size
             if len(frame_header_data) < 24:
@@ -446,6 +450,27 @@ class Lvx2ParserNode(Node):
 
                 pkg_timestamp_ns = struct.unpack('<Q', timestamp_bytes)[0] # [cite: 52] nanosecond timestamp
 
+                # Per-LiDAR non-monotonic check (only if using original timestamps for pacing)
+                if self.use_original_timestamps:
+                    last_ts_for_this_lidar = self.last_timestamp_ns_per_lidar.get(lidar_id)
+                    if last_ts_for_this_lidar is not None:
+                        per_lidar_delta_ns = pkg_timestamp_ns - last_ts_for_this_lidar
+                        if per_lidar_delta_ns < 0:
+                            self.get_logger().warning(
+                                f"Frame {frame_idx}, LiDAR ID {lidar_id}: Non-monotonic timestamp! "
+                                f"Prev: {last_ts_for_this_lidar}, Curr: {pkg_timestamp_ns}, "
+                                f"Delta: {per_lidar_delta_ns/1e6:.2f} ms."
+                            )
+                            any_lidar_had_timestamp_issue_this_frame = True
+                        # else: current_lidar_target_delay_ns = per_lidar_delta_ns (not used for main pacing yet)
+                    else: # First packet for this LiDAR ever
+                        self.get_logger().info(
+                            f"Frame {frame_idx}, LiDAR ID {lidar_id}: First packet seen for this LiDAR, "
+                            "cannot calculate delta. Will use default pacing if this is the first frame overall."
+                        )
+                        any_lidar_had_timestamp_issue_this_frame = True
+                    self.last_timestamp_ns_per_lidar[lidar_id] = pkg_timestamp_ns
+
                 if current_frame_first_pkg_ts_ns is None:
                     current_frame_first_pkg_ts_ns = pkg_timestamp_ns
 
@@ -506,6 +531,8 @@ class Lvx2ParserNode(Node):
                         current_lidar_data['intensity_vals'].extend(points_array['intensity'].astype(np.float32).tolist())
                         current_lidar_data['tag_vals'].extend(points_array['tag'].tolist())
 
+            package_reading_done_time_ns = self.get_clock().now().nanoseconds
+            self.get_logger().info(f"Frame {frame_idx}: Time spent reading all packages: {(package_reading_done_time_ns - frame_processing_start_time_ns) / 1e6:.2f} ms")
 
             # Determine the timestamp for publishing messages for THIS frame
             # and for calculating delay relative to the PREVIOUS frame.
@@ -527,32 +554,52 @@ class Lvx2ParserNode(Node):
             if self.use_original_timestamps:
                 if previous_frame_original_ts_for_delay_calc_ns is not None and \
                    current_frame_first_pkg_ts_ns is not None:
-                    # Target delay based on original timestamps
                     target_delay_from_timestamps_ns = current_frame_first_pkg_ts_ns - previous_frame_original_ts_for_delay_calc_ns
-                    if target_delay_from_timestamps_ns < 0: # Timestamps not monotonic
-                        self.get_logger().warning(f"Frame {frame_idx}: Non-monotonic original timestamps detected ({target_delay_from_timestamps_ns}ns). Using default frame duration.")
-                        target_delay_from_timestamps_ns = self.device_frame_duration_ms * 1_000_000
+                else: # First frame or issue with current_frame_first_pkg_ts_ns (e.g. empty frame)
+                    target_delay_from_timestamps_ns = self.device_frame_duration_ms * 1_000_000
+
+                # Override target_delay if overall frame timestamp is non-monotonic or any LiDAR had an issue
+                if target_delay_from_timestamps_ns < 0 or any_lidar_had_timestamp_issue_this_frame:
+                    if target_delay_from_timestamps_ns < 0 and not any_lidar_had_timestamp_issue_this_frame:
+                        self.get_logger().info(
+                            f"Frame {frame_idx}: Overall frame-level non-monotonic timestamp detected "
+                            f"(FirstPktTS: {current_frame_first_pkg_ts_ns} vs PrevFirstPktTS: {previous_frame_original_ts_for_delay_calc_ns}). "
+                            "Using device frame duration for pacing."
+                        )
+                    elif any_lidar_had_timestamp_issue_this_frame:
+                         self.get_logger().info(
+                            f"Frame {frame_idx}: A LiDAR had a timestamp issue (non-monotonic or first packet). "
+                            "Using device frame duration for pacing."
+                        )
+                    # If target_delay_from_timestamps_ns was positive but any_lidar_had_timestamp_issue_this_frame is true,
+                    # it implies the issue was purely per-LiDAR and didn't make the overall frame delta negative.
+                    # Still, we use default pacing for caution.
                     
-                    # Time spent on processing/IO for the *previous* frame cycle
-                    time_spent_on_prev_cycle_ns = self.get_clock().now().nanoseconds - time_system_at_start_of_prev_frame_publish_cycle_ns
-                    
-                    sleep_duration_ns = max(0, target_delay_from_timestamps_ns - time_spent_on_prev_cycle_ns)
-                    if sleep_duration_ns > 0:
-                        time.sleep(sleep_duration_ns / 1_000_000_000.0)
-                        self.get_logger().debug(f"Frame {frame_idx}: Slept for {sleep_duration_ns / 1e6:.2f} ms to match original timestamps.")
+                    target_delay_from_timestamps_ns = self.device_frame_duration_ms * 1_000_000
+
+                # Calculate time spent on current cycle's processing so far (before sleep)
+                time_spent_on_current_cycle_ns = self.get_clock().now().nanoseconds - current_cycle_start_time_ns
+
+                sleep_duration_ns = max(0, target_delay_from_timestamps_ns - time_spent_on_current_cycle_ns)
+                if sleep_duration_ns > 0:
+                    time.sleep(sleep_duration_ns / 1_000_000_000.0)
+                    self.get_logger().debug(f"Frame {frame_idx}: Slept for {sleep_duration_ns / 1e6:.2f} ms. Target delay: {target_delay_from_timestamps_ns/1e6:.2f}ms, Current cycle processing: {time_spent_on_current_cycle_ns/1e6:.2f}ms.")
+
                 # Update for next iteration's delay calculation
                 if current_frame_first_pkg_ts_ns is not None: # Only update if current frame provided a valid timestamp
                      previous_frame_original_ts_for_delay_calc_ns = current_frame_first_pkg_ts_ns
             else: # Fallback to fixed rate playback
                 if self.playback_rate_hz > 0:
+                    # Note: This simple sleep doesn't account for processing time.
+                    # For more accurate fixed rate, processing time would need to be subtracted.
                     time.sleep(1.0 / self.playback_rate_hz)
             
-            # Record system time after potential sleep, before current frame's heavy processing/publishing
-            time_system_at_start_of_prev_frame_publish_cycle_ns = self.get_clock().now().nanoseconds
             ros_frame_publish_time = livox_ts_to_ros_time(frame_publication_ts_ns_for_header)
 
             # After all packages for this frame are read, process and then publish PointCloud2 and IMU messages
+            # data_conversion_and_publish_start_time_ns = self.get_clock().now().nanoseconds # Covered by package_reading_done_time_ns
             for lidar_id, collected_data in points_by_lidar_in_frame.items():
+                data_conversion_start_time_ns = self.get_clock().now().nanoseconds
                 if self.selected_lidar_ids and lidar_id not in self.selected_lidar_ids:
                     self.get_logger().debug(f"Skipping LiDAR ID {lidar_id} as it's not in the selected list for frame {frame_idx}.")
                     continue
@@ -567,14 +614,17 @@ class Lvx2ParserNode(Node):
                     ('intensity', '<f4'), ('tag', 'u1')
                 ])
                 final_points_array = np.empty(num_total_points_for_lidar, dtype=dtype_pointcloud_point)
-                final_points_array['x'] = collected_data['x_coords']
+                final_points_array['x'] = collected_data['x_coords'] # Assumes these are already np.array or list
                 final_points_array['y'] = collected_data['y_coords']
                 final_points_array['z'] = collected_data['z_coords']
                 final_points_array['intensity'] = collected_data['intensity_vals']
                 final_points_array['tag'] = collected_data['tag_vals']
 
                 all_points_bytes = final_points_array.tobytes()
-                collected_data['all_points_bytes'] = all_points_bytes # Store for publishing
+                data_conversion_done_time_ns = self.get_clock().now().nanoseconds
+                self.get_logger().debug(f"Frame {frame_idx}, LiDAR {lidar_id}: Data conversion (lists to bytes): {(data_conversion_done_time_ns - data_conversion_start_time_ns) / 1e6:.2f} ms")
+
+                # collected_data['all_points_bytes'] = all_points_bytes # Store for publishing - already done by original optimization
 
                 if lidar_id not in self.publishers_:
                     self.get_logger().warning(f"Frame {frame_idx}: LiDAR ID {lidar_id} has data but no PointCloud2 publisher. Skipping.")
@@ -596,9 +646,10 @@ class Lvx2ParserNode(Node):
                 ]
                 pc_msg.point_step = 17 # 3*4 + 4 + 1 bytes
                 pc_msg.row_step = pc_msg.point_step * num_total_points_for_lidar
-                pc_msg.data = collected_data['all_points_bytes'] # Use the newly created bytes
+                pc_msg.data = all_points_bytes # Use the bytes directly
                 self.publishers_[lidar_id].publish(pc_msg)
-                self.get_logger().debug(f"Published PointCloud2 for LiDAR {lidar_id} from frame {frame_idx} with {num_total_points_for_lidar} points.")
+
+                imu_publish_start_time_ns = self.get_clock().now().nanoseconds # Approx, as pc_msg publish was just before
 
                 # Publish IMU message if publisher exists for this LiDAR ID
                 if lidar_id in self.imu_publishers_ and self.device_infos_[lidar_id].get('extrinsic_enable') == 1:
@@ -628,8 +679,15 @@ class Lvx2ParserNode(Node):
                     imu_msg.linear_acceleration_covariance = [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] # Mark as unavailable
                     
                     self.imu_publishers_[lidar_id].publish(imu_msg)
-                    self.get_logger().debug(f"Published IMU for LiDAR {lidar_id} from frame {frame_idx}.")
+                    publish_done_time_ns = self.get_clock().now().nanoseconds
+                    self.get_logger().debug(f"Frame {frame_idx}, LiDAR {lidar_id}: Publishing PC2 (and IMU): {(publish_done_time_ns - data_conversion_done_time_ns) / 1e6:.2f} ms (PC2 conv to IMU pub end)")
+                    # Note: This timing includes IMU publish. If IMU not present, it's mostly PC2 publish time.
+                else: # No IMU publish
+                    publish_done_time_ns = self.get_clock().now().nanoseconds
+                    self.get_logger().debug(f"Frame {frame_idx}, LiDAR {lidar_id}: Publishing PC2: {(publish_done_time_ns - data_conversion_done_time_ns) / 1e6:.2f} ms (PC2 conv to PC2 pub end)")
 
+            all_publishing_done_time_ns = self.get_clock().now().nanoseconds
+            self.get_logger().info(f"Frame {frame_idx}: Time spent converting & publishing all messages: {(all_publishing_done_time_ns - package_reading_done_time_ns) / 1e6:.2f} ms")
 
             frame_count_overall += 1
             if next_offset_abs == 0: # Last frame processed
@@ -660,8 +718,8 @@ class Lvx2ParserNode(Node):
 
                     if self.loop_playback and rclpy.ok():
                         self.get_logger().info("Looping playback from the beginning.")
-                        # Reset timestamp tracking for loop
-                        # These are reset inside _parse_point_cloud_data_block at its start
+                        self.last_timestamp_ns_per_lidar.clear() # Clear last timestamps for fresh start
+                        # Reset overall timestamp tracking for loop (already handled by _parse_point_cloud_data_block re-entry)
                         time.sleep(0.1) # Brief pause before looping
                     else:
                         self.get_logger().info("Playback finished (or loop_playback is false).")
