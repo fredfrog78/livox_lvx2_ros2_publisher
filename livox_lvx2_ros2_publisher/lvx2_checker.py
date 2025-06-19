@@ -46,13 +46,27 @@ class Lvx2Checker:
         self.device_count = 0 # From private header
 
         # For timestamp and frame analysis
-        self.frame_timestamps_ns = [] # List of first package timestamp for each frame
-        self.non_monotonic_timestamp_jumps = 0
-        self.estimated_fps_from_timestamps = 0.0 # For summary report
-        self.avg_delta_ms_from_timestamps = 0.0 # For summary report
+        self.frame_timestamps_ns = [] # For overall, first-packet-per-frame analysis
         self.frame_read_errors = 0
         self.package_read_errors = 0
         self.offset_mismatches = 0
+
+        # Overall timestamp stats (based on self.frame_timestamps_ns)
+        self.overall_non_monotonic_jumps = 0 # Renamed from non_monotonic_timestamp_jumps
+        self.overall_estimated_fps = 0.0     # Renamed
+        self.overall_avg_delta_ms = 0.0      # Renamed
+        self.overall_min_delta_ms = 0.0
+        self.overall_max_delta_ms = 0.0
+        self.overall_std_delta_ms = 0.0
+
+        # Per-LiDAR timestamp data and stats
+        self.lidar_frame_timestamps_ns = {}    # Key: lidar_id, Value: list of timestamps
+        self.lidar_non_monotonic_jumps = {}    # Key: lidar_id, Value: count
+        self.lidar_avg_delta_ms = {}         # Key: lidar_id, Value: avg delta in ms
+        self.lidar_min_delta_ms = {}         # Key: lidar_id, Value: min delta in ms
+        self.lidar_max_delta_ms = {}         # Key: lidar_id, Value: max delta in ms
+        self.lidar_std_delta_ms = {}         # Key: lidar_id, Value: std dev of deltas in ms
+        self.lidar_estimated_fps = {}        # Key: lidar_id, Value: estimated FPS
 
 
     def check_file(self):
@@ -280,7 +294,11 @@ class Lvx2Checker:
             current_offset_abs, next_offset_abs, frame_idx = struct.unpack('<QQQ', frame_header_data)
             print_info(f"Frame {frame_idx}: FileOffset={current_frame_offset_in_file}, HeaderCurrentOffset={current_offset_abs}, HeaderNextOffset={next_offset_abs}")
             frame_count_for_eof_check += 1
-            first_package_in_frame = True # For timestamp extraction
+
+            # For overall first-package-in-frame timestamp (used for self.frame_timestamps_ns)
+            overall_first_pkg_in_frame_ts_collected = False
+            # For per-LiDAR first-package-in-frame timestamp for the current LVX frame
+            lidars_seen_in_current_frame = set()
 
             if current_offset_abs != current_frame_offset_in_file:
                 print_warn(f"Frame {frame_idx}: Mismatch in current offset. File says {current_offset_abs}, expected {current_frame_offset_in_file}. Seeking to header's offset.")
@@ -315,10 +333,17 @@ class Lvx2Checker:
                 timestamp_bytes, udp_counter, data_type, point_data_len, \
                 frame_ctr_res, reserved_final_bytes = struct.unpack('<BIBB8sHBIB4s', pkg_header_bytes)
 
-                if first_package_in_frame:
-                    pkg_timestamp_ns = struct.unpack('<Q', timestamp_bytes)[0]
+                pkg_timestamp_ns = struct.unpack('<Q', timestamp_bytes)[0]
+
+                # Overall first package timestamp for the frame
+                if not overall_first_pkg_in_frame_ts_collected:
                     self.frame_timestamps_ns.append(pkg_timestamp_ns)
-                    first_package_in_frame = False
+                    overall_first_pkg_in_frame_ts_collected = True
+
+                # Per-LiDAR first package timestamp for this frame
+                if lidar_id not in lidars_seen_in_current_frame:
+                    self.lidar_frame_timestamps_ns.setdefault(lidar_id, []).append(pkg_timestamp_ns)
+                    lidars_seen_in_current_frame.add(lidar_id)
 
                 package_read_pos += 27
                 packages_in_frame_count += 1
@@ -373,58 +398,119 @@ class Lvx2Checker:
         return True
 
     def _perform_timestamp_analysis(self):
-        print_header("\nTimestamp Analysis:")
+        print_header("\nOverall Frame Timestamp Analysis (based on first package in each LVX frame):")
         if len(self.frame_timestamps_ns) < 2:
-            print_warn("Not enough frame timestamps collected to perform detailed analysis.")
+            print_warn("  Not enough overall frame timestamps collected to perform detailed analysis.")
+        else:
+            valid_overall_deltas_ns = []
+            self.overall_non_monotonic_jumps = 0 # Initialize/reset before calculation
+
+            for i in range(1, len(self.frame_timestamps_ns)):
+                prev_ts = self.frame_timestamps_ns[i-1]
+                curr_ts = self.frame_timestamps_ns[i]
+                delta_ns = curr_ts - prev_ts
+
+                if delta_ns < 0:
+                    self.overall_non_monotonic_jumps += 1
+                    print_warn(f"  Overall Frame {i} vs {i-1}: Non-monotonic! Prev: {prev_ts}, Curr: {curr_ts}, Delta: {delta_ns/1e6:.2f} ms")
+                else:
+                    valid_overall_deltas_ns.append(delta_ns)
+                    # Optional: print_info(f"  Overall Frame {i} vs {i-1}: Delta: {delta_ns/1e6:.2f} ms")
+                    if self.frame_duration_ms > 0:
+                        expected_delta_ns = self.frame_duration_ms * 1_000_000
+                        if expected_delta_ns > 1000:
+                            diff_from_expected_percentage = abs((delta_ns - expected_delta_ns) / expected_delta_ns)
+                            if diff_from_expected_percentage > 0.1:
+                                print_warn(f"    Overall Frame {i}: Delta {delta_ns/1e6:.2f} ms significantly deviates from expected {self.frame_duration_ms} ms.")
+                        elif delta_ns > (expected_delta_ns * 1.1) or delta_ns < (expected_delta_ns * 0.9):
+                             print_warn(f"    Overall Frame {i}: Delta {delta_ns/1e6:.2f} ms deviates from expected {self.frame_duration_ms} ms.")
+
+            print_info(f"  Total overall non-monotonic timestamp jumps: {self.overall_non_monotonic_jumps}")
+            if valid_overall_deltas_ns:
+                self.overall_min_delta_ms = np.min(valid_overall_deltas_ns) / 1e6
+                self.overall_max_delta_ms = np.max(valid_overall_deltas_ns) / 1e6
+                self.overall_avg_delta_ms = np.mean(valid_overall_deltas_ns) / 1e6
+                self.overall_std_delta_ms = np.std(valid_overall_deltas_ns) / 1e6
+                print_info(f"  Overall inter-frame deltas (ms): Min={self.overall_min_delta_ms:.2f}, Max={self.overall_max_delta_ms:.2f}, Avg={self.overall_avg_delta_ms:.2f}, StdDev={self.overall_std_delta_ms:.2f}")
+
+                if len(self.frame_timestamps_ns) > 1:
+                    total_duration_s = (self.frame_timestamps_ns[-1] - self.frame_timestamps_ns[0]) / 1e9
+                    if total_duration_s > 0:
+                        self.overall_estimated_fps = (len(self.frame_timestamps_ns) - 1) / total_duration_s
+                        print_info(f"  Overall estimated frame rate: {self.overall_estimated_fps:.2f} Hz ({len(self.frame_timestamps_ns)-1} intervals over {total_duration_s:.2f} s)")
+                    else:
+                        print_warn("  Overall total duration of timestamped frames is zero. Cannot estimate FPS.")
+                        self.overall_estimated_fps = 0.0
+            elif self.overall_non_monotonic_jumps > 0:
+                print_warn("  No valid positive overall deltas to calculate statistics due to non-monotonic timestamps.")
+            else:
+                print_warn("  No valid overall deltas to calculate statistics.")
+
+        # Per-LiDAR Analysis Section
+        print_header("\nPer-LiDAR Timestamp Analysis (based on first package from each LiDAR per LVX frame):")
+        if not self.lidar_frame_timestamps_ns:
+            print_warn("  No per-LiDAR timestamp data collected.")
             return
 
-        valid_deltas_ns = []
-        # Reset non_monotonic_timestamp_jumps for multiple calls if file is re-analyzed (though not typical for this script)
-        # self.non_monotonic_timestamp_jumps = 0 # Decided against resetting here, it's an accumulator for the whole file check
+        for lidar_id, timestamps_ns_list in self.lidar_frame_timestamps_ns.items():
+            print_header(f"  LiDAR ID: {lidar_id}")
+            if len(timestamps_ns_list) < 2:
+                print_warn(f"    Not enough timestamps for LiDAR {lidar_id} to perform detailed analysis.")
+                self.lidar_non_monotonic_jumps[lidar_id] = 0 # Ensure key exists even if no analysis
+                self.lidar_estimated_fps[lidar_id] = 0.0
+                self.lidar_avg_delta_ms[lidar_id] = 0.0
+                continue
 
-        for i in range(1, len(self.frame_timestamps_ns)):
-            prev_ts = self.frame_timestamps_ns[i-1]
-            curr_ts = self.frame_timestamps_ns[i]
-            delta_ns = curr_ts - prev_ts
+            current_lidar_non_monotonic_jumps = 0
+            current_lidar_valid_deltas_ns = []
 
-            if delta_ns < 0:
-                self.non_monotonic_timestamp_jumps += 1
-                print_warn(f"  Frame {i} vs {i-1}: Non-monotonic timestamp! Prev: {prev_ts}, Curr: {curr_ts}, Delta: {delta_ns/1e6:.2f} ms")
+            for i in range(1, len(timestamps_ns_list)):
+                prev_ts = timestamps_ns_list[i-1]
+                curr_ts = timestamps_ns_list[i]
+                delta_ns = curr_ts - prev_ts
+
+                if delta_ns < 0:
+                    current_lidar_non_monotonic_jumps += 1
+                    print_warn(f"    Frame index {i} (LiDAR {lidar_id}): Non-monotonic! Prev: {prev_ts}, Curr: {curr_ts}, Delta: {delta_ns/1e6:.2f} ms")
+                else:
+                    current_lidar_valid_deltas_ns.append(delta_ns)
+                    # print_info(f"    Frame {i} vs {i-1} (LiDAR {lidar_id}): Delta: {delta_ns/1e6:.2f} ms") # Verbose
+                    if self.frame_duration_ms > 0: # Using overall frame duration for comparison
+                        expected_delta_ns = self.frame_duration_ms * 1_000_000
+                        if expected_delta_ns > 1000: # Avoid division by zero for tiny expected deltas
+                            diff_from_expected_percentage = abs((delta_ns - expected_delta_ns) / expected_delta_ns)
+                            if diff_from_expected_percentage > 0.10:
+                                print_warn(f"      Timestamp {i} for LiDAR {lidar_id}: Delta {delta_ns/1e6:.2f} ms significantly deviates from overall expected frame duration {self.frame_duration_ms} ms.")
+                        elif delta_ns > (expected_delta_ns * 1.1) or delta_ns < (expected_delta_ns * 0.9) : # Fallback for very small expected durations
+                             print_warn(f"      Timestamp {i} for LiDAR {lidar_id}: Delta {delta_ns/1e6:.2f} ms deviates from overall expected frame duration {self.frame_duration_ms} ms.")
+
+            self.lidar_non_monotonic_jumps[lidar_id] = current_lidar_non_monotonic_jumps
+            print_info(f"    LiDAR {lidar_id} - Total non-monotonic jumps: {current_lidar_non_monotonic_jumps}")
+
+            if current_lidar_valid_deltas_ns:
+                self.lidar_min_delta_ms[lidar_id] = np.min(current_lidar_valid_deltas_ns) / 1e6
+                self.lidar_max_delta_ms[lidar_id] = np.max(current_lidar_valid_deltas_ns) / 1e6
+                self.lidar_avg_delta_ms[lidar_id] = np.mean(current_lidar_valid_deltas_ns) / 1e6
+                self.lidar_std_delta_ms[lidar_id] = np.std(current_lidar_valid_deltas_ns) / 1e6
+                print_info(f"    LiDAR {lidar_id} - Inter-frame deltas (ms): Min={self.lidar_min_delta_ms[lidar_id]:.2f}, Max={self.lidar_max_delta_ms[lidar_id]:.2f}, Avg={self.lidar_avg_delta_ms[lidar_id]:.2f}, StdDev={self.lidar_std_delta_ms[lidar_id]:.2f}")
+
+                total_duration_s_lidar = (timestamps_ns_list[-1] - timestamps_ns_list[0]) / 1e9
+                if total_duration_s_lidar > 0 and len(timestamps_ns_list) > 1:
+                    self.lidar_estimated_fps[lidar_id] = (len(timestamps_ns_list) - 1) / total_duration_s_lidar
+                    print_info(f"    LiDAR {lidar_id} - Estimated average frame rate: {self.lidar_estimated_fps[lidar_id]:.2f} Hz (based on {len(timestamps_ns_list)} timestamps)")
+                else:
+                    self.lidar_estimated_fps[lidar_id] = 0.0
+                    if len(timestamps_ns_list) > 1 :
+                         print_warn(f"    LiDAR {lidar_id} - Total duration of timestamped frames is zero. Cannot estimate FPS.")
+            elif current_lidar_non_monotonic_jumps > 0:
+                print_warn(f"    LiDAR {lidar_id} - No valid positive deltas to calculate statistics due to non-monotonic timestamps.")
+                self.lidar_avg_delta_ms[lidar_id] = 0.0 # Ensure keys exist
+                self.lidar_estimated_fps[lidar_id] = 0.0
             else:
-                valid_deltas_ns.append(delta_ns)
-                print_info(f"  Frame {i} vs {i-1}: Delta: {delta_ns/1e6:.2f} ms")
-                if self.frame_duration_ms > 0: # frame_duration_ms from private header
-                    expected_delta_ns = self.frame_duration_ms * 1_000_000
-                    # Check if expected_delta_ns is too small to avoid division by zero or tiny numbers
-                    if expected_delta_ns > 1000: # e.g. > 1 microsecond
-                        diff_from_expected_percentage = abs((delta_ns - expected_delta_ns) / expected_delta_ns)
-                        if diff_from_expected_percentage > 0.1: # More than 10% deviation
-                            print_warn(f"    Significant deviation from expected frame duration ({self.frame_duration_ms} ms). Actual: {delta_ns/1e6:.2f} ms, Expected: {expected_delta_ns/1e6:.2f} ms")
-                    elif delta_ns > (self.frame_duration_ms * 1_000_000 * 1.1) or delta_ns < (self.frame_duration_ms * 1_000_000 * 0.9) : # Fallback for very small expected durations
-                         print_warn(f"    Deviation from expected frame duration ({self.frame_duration_ms} ms). Actual: {delta_ns/1e6:.2f} ms")
+                print_warn(f"    LiDAR {lidar_id} - No valid deltas to calculate statistics.")
+                self.lidar_avg_delta_ms[lidar_id] = 0.0 # Ensure keys exist
+                self.lidar_estimated_fps[lidar_id] = 0.0
 
-
-        print_info(f"Total non-monotonic timestamp jumps: {self.non_monotonic_timestamp_jumps}")
-        if valid_deltas_ns:
-            min_delta_ms = np.min(valid_deltas_ns) / 1e6
-            max_delta_ms = np.max(valid_deltas_ns) / 1e6
-            self.avg_delta_ms_from_timestamps = np.mean(valid_deltas_ns) / 1e6 # Store for summary
-            std_delta_ms = np.std(valid_deltas_ns) / 1e6
-            print_info(f"Inter-frame timestamp deltas (ms): Min={min_delta_ms:.2f}, Max={max_delta_ms:.2f}, Avg={self.avg_delta_ms_from_timestamps:.2f}, StdDev={std_delta_ms:.2f}")
-
-            if len(self.frame_timestamps_ns) > 1 :
-                total_duration_s = (self.frame_timestamps_ns[-1] - self.frame_timestamps_ns[0]) / 1e9
-                if total_duration_s > 0: # Avoid division by zero if first and last timestamp are the same
-                    self.estimated_fps_from_timestamps = (len(self.frame_timestamps_ns) - 1) / total_duration_s # Store for summary
-                    print_info(f"Estimated average frame rate from timestamps: {self.estimated_fps_from_timestamps:.2f} Hz ({len(self.frame_timestamps_ns)-1} intervals over {total_duration_s:.2f} s)")
-                elif len(self.frame_timestamps_ns) -1 > 0 : # Many frames but zero duration
-                     print_warn("Total duration of timestamped frames is zero. Cannot estimate FPS.")
-                     self.estimated_fps_from_timestamps = 0 # Explicitly set
-                # else only one frame timestamp, no interval
-        elif self.non_monotonic_timestamp_jumps > 0 and not valid_deltas_ns:
-             print_warn("No valid positive deltas to calculate statistics due to all-or-nothing non-monotonic timestamps.")
-        else: # No valid deltas and no non-monotonic jumps (implies < 2 timestamps)
-            print_warn("No valid deltas to calculate further statistics (likely due to insufficient number of timestamps).")
 
     def _print_summary_report(self):
         print_header("\n--- LVX2 File Integrity Check Summary ---")
@@ -466,16 +552,31 @@ class Lvx2Checker:
         print_info(f"  Package Read/Format Errors: {self.package_read_errors}")
         print_info(f"  Frame Read/Offset Errors: {self.frame_read_errors}")
 
-        print_header("\nTimestamp Analysis Summary:")
-        print_info(f"  Non-monotonic Timestamp Jumps: {self.non_monotonic_timestamp_jumps}")
+        print_header("\nOverall Timestamp Analysis Summary (First Pkg per LVX Frame):")
+        print_info(f"  Non-monotonic Jumps: {self.overall_non_monotonic_jumps}")
         if len(self.frame_timestamps_ns) >= 2 :
-            print_info(f"  Estimated Average Frame Rate: {self.estimated_fps_from_timestamps:.2f} Hz")
-            print_info(f"  Average Inter-frame Delta: {self.avg_delta_ms_from_timestamps:.2f} ms")
+            print_info(f"  Estimated Avg Frame Rate: {self.overall_estimated_fps:.2f} Hz")
+            print_info(f"  Avg Inter-frame Delta: {self.overall_avg_delta_ms:.2f} ms (Min: {self.overall_min_delta_ms:.2f}, Max: {self.overall_max_delta_ms:.2f}, StdDev: {self.overall_std_delta_ms:.2f})")
         else:
-            print_warn("  Not enough timestamps for detailed FPS/Delta analysis.")
+            print_warn("  Not enough overall timestamps for detailed FPS/Delta analysis.")
 
-        total_errors = self.offset_mismatches + self.package_read_errors + self.frame_read_errors + self.non_monotonic_timestamp_jumps
-        # Add other critical errors if they set flags or counters
+        print_header("\nPer-LiDAR Timestamp Analysis Summary (First Pkg per LiDAR per LVX Frame):")
+        if self.lidar_frame_timestamps_ns:
+            for lidar_id in sorted(self.lidar_frame_timestamps_ns.keys()):
+                print_info(f"  LiDAR ID: {lidar_id}")
+                print_info(f"    Non-monotonic Jumps: {self.lidar_non_monotonic_jumps.get(lidar_id, 'N/A')}")
+                if self.lidar_estimated_fps.get(lidar_id, 0) > 0 or len(self.lidar_frame_timestamps_ns.get(lidar_id,[])) >=2 :
+                    print_info(f"    Estimated Avg Frame Rate: {self.lidar_estimated_fps.get(lidar_id, 0.0):.2f} Hz")
+                    print_info(f"    Avg Inter-frame Delta: {self.lidar_avg_delta_ms.get(lidar_id, 0.0):.2f} ms (Min: {self.lidar_min_delta_ms.get(lidar_id,0.0):.2f}, Max: {self.lidar_max_delta_ms.get(lidar_id,0.0):.2f}, StdDev: {self.lidar_std_delta_ms.get(lidar_id,0.0):.2f})")
+                else:
+                    print_warn(f"    Not enough timestamps for LiDAR {lidar_id} for detailed FPS/Delta stats.")
+        else:
+            print_info("  No per-LiDAR timestamp data collected or analyzed.")
+
+
+        total_errors = self.offset_mismatches + self.package_read_errors + self.frame_read_errors + self.overall_non_monotonic_jumps
+        for lidar_id in self.lidar_non_monotonic_jumps: # Add per-lidar non-monotonic jumps to total errors
+            total_errors += self.lidar_non_monotonic_jumps[lidar_id]
 
         print_header("\nOverall Status:")
         if total_errors > 0:
