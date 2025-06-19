@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import PointCloud2, PointField, Imu
 from builtin_interfaces.msg import Time as RosTime
@@ -36,6 +37,16 @@ class Lvx2ParserNode(Node):
         self.declare_parameter('use_original_timestamps', False)
         self.declare_parameter('playback_rate_hz', 20.0) # Fallback if not using original timestamps
         self.declare_parameter('loop_playback', False)
+        self.declare_parameter('list_lidars',
+                               value=False,
+                               descriptor=ParameterDescriptor(
+                                   type=rclpy.Parameter.Type.BOOL,
+                                   description='Set to True to list LiDAR info and exit.'))
+        self.declare_parameter('lidar_ids',
+                               '',  # Default value
+                               ParameterDescriptor(
+                                   description='Comma-separated list of LiDAR IDs to filter playback. Can be set as a string or an integer if only one ID and no comma is used.',
+                                   dynamic_typing=True)) # Enable dynamic typing
 
         # Get parameters
         self.lvx_file_path = self.get_parameter('lvx_file_path').get_parameter_value().string_value
@@ -46,11 +57,49 @@ class Lvx2ParserNode(Node):
         self.use_original_timestamps = self.get_parameter('use_original_timestamps').get_parameter_value().bool_value
         self.playback_rate_hz = self.get_parameter('playback_rate_hz').get_parameter_value().double_value
         self.loop_playback = self.get_parameter('loop_playback').get_parameter_value().bool_value
+        self.list_lidars = self.get_parameter('list_lidars').get_parameter_value().bool_value
 
-        if not self.lvx_file_path or not os.path.exists(self.lvx_file_path):
-            self.get_logger().error(f"LVX file path is invalid or file does not exist: {self.lvx_file_path}")
-            #rclpy.shutdown() # Avoid shutting down here if used as a library
-            return
+        # Get the lidar_ids parameter (which will be a ParameterValue object due to dynamic_typing)
+        param_value_msg = self.get_parameter('lidar_ids').get_parameter_value()
+
+        self.lidar_ids_str = '' # Default to empty string
+
+        if param_value_msg.type == ParameterType.PARAMETER_STRING:
+            self.lidar_ids_str = param_value_msg.string_value
+            self.get_logger().info(f"Received lidar_ids as string: '{self.lidar_ids_str}'")
+        elif param_value_msg.type == ParameterType.PARAMETER_INTEGER:
+            # This case handles when a single numeric ID is passed and gets coerced to an integer
+            # by the parameter system before rclpy receives it.
+            self.lidar_ids_str = str(param_value_msg.integer_value)
+            self.get_logger().info(f"Received lidar_ids as integer: {param_value_msg.integer_value}, converted to string: '{self.lidar_ids_str}'")
+        elif param_value_msg.type == ParameterType.PARAMETER_NOT_SET and param_value_msg.string_value == '':
+            # This handles the default case where the parameter is not set and defaults to empty string
+            self.get_logger().info("lidar_ids parameter not set or empty, no filtering will be applied.")
+            self.lidar_ids_str = '' # Explicitly ensure it's an empty string
+        else:
+            self.get_logger().warning(
+                f"lidar_ids parameter has unexpected type ({param_value_msg.type}) or value. "
+                f"String: '{param_value_msg.string_value}', Int: {param_value_msg.integer_value}. "
+                f"Defaulting to no filtering."
+            )
+            self.lidar_ids_str = ''
+
+        # The rest of the parsing logic for self.lidar_ids_str into self.selected_lidar_ids remains the same:
+        self.selected_lidar_ids = []
+        if self.lidar_ids_str:
+            try:
+                processed_ids_str = self.lidar_ids_str.strip().rstrip(',')
+                if processed_ids_str:
+                    self.selected_lidar_ids = [int(id_str.strip()) for id_str in processed_ids_str.split(',') if id_str.strip()]
+                    if self.selected_lidar_ids:
+                        self.get_logger().info(f"Playback will be filtered for LiDAR IDs: {self.selected_lidar_ids}")
+                    elif self.lidar_ids_str:
+                        self.get_logger().info(f"Lidar IDs string '{self.lidar_ids_str}' resulted in no valid IDs for filtering; no filtering applied.")
+                elif self.lidar_ids_str:
+                     self.get_logger().info(f"Lidar IDs string '{self.lidar_ids_str}' became empty after processing; no filtering applied.")
+            except ValueError:
+                self.get_logger().error(f"Invalid format for lidar_ids string: '{self.lidar_ids_str}' after processing. Please use comma-separated integers. Disabling filtering.")
+                self.selected_lidar_ids = []
 
         self.publishers_ = {}  # Dict to store PointCloud2 publishers: {lidar_id: publisher}
         self.imu_publishers_ = {} # Dict to store IMU publishers: {lidar_id: publisher}
@@ -62,10 +111,73 @@ class Lvx2ParserNode(Node):
         # Defer processing to a separate method or timer to allow __init__ to complete
         self.timer = self.create_timer(0.01, self.start_processing_once)
 
+    def display_lidar_information_and_exit(self):
+        self.get_logger().info("Displaying LiDAR information and preparing to exit...")
+        try:
+            with open(self.lvx_file_path, 'rb') as f:
+                if not self._parse_public_header(f):
+                    self.get_logger().error("Failed to parse public header for listing. Aborting list.")
+                    return # This will lead to the finally block
+                if not self._parse_private_header(f):
+                    self.get_logger().error("Failed to parse private header for listing. Aborting list.")
+                    return # This will lead to the finally block
+
+                # Use print for actual Lidar details, logger for status messages
+                print("-----------------------------------------------------")
+                print("             LiDAR Device Information")
+                print("-----------------------------------------------------")
+                self.get_logger().info("Successfully parsed headers. Reading device info blocks...")
+
+                for i in range(self.device_count):
+                    dev_info_data = f.read(63)
+                    if len(dev_info_data) < 63:
+                        self.get_logger().error(f"Device Info {i}: Unexpected EOF while listing. Expected 63 bytes, got {len(dev_info_data)}. Aborting list.")
+                        return # This will lead to the finally block
+
+                    lidar_sn_bytes, hub_sn_bytes, lidar_id, lidar_type_reserved, device_type, \
+                    extrinsic_enable, roll, pitch, yaw, x, y, z = \
+                    struct.unpack('<16s16sIBBBffffff', dev_info_data)
+
+                    lidar_sn = lidar_sn_bytes.split(b'\0',1)[0].decode('ascii', errors='ignore')
+                    hub_sn = hub_sn_bytes.split(b'\0',1)[0].decode('ascii', errors='ignore')
+
+                    # Use print for direct console output for this CLI-like feature
+                    print(f"  LIDAR ID: {lidar_id}")
+                    print(f"    SN: {lidar_sn}")
+                    if hub_sn:
+                        print(f"    Hub SN: {hub_sn}")
+                    print(f"    Device Type Code: {device_type}") # Renamed for clarity
+                    device_type_map = {0: "HAP (TX)", 1: "MID40", 2: "TELE", 3: "AVIA", 6: "MID70", 9: "MID360", 10: "HAP (RX)"}
+                    print(f"    Device Type Name: {device_type_map.get(device_type, 'Unknown')}")
+                    print(f"    Extrinsics Enabled: {'Yes' if extrinsic_enable == 1 else 'No'}")
+                    if extrinsic_enable == 1:
+                        print(f"    Extrinsics (Roll,Pitch,Yaw,X,Y,Z): {roll:.2f}deg, {pitch:.2f}deg, {yaw:.2f}deg, {x:.2f}m, {y:.2f}m, {z:.2f}m")
+                    print("-----------------------------------------------------") # Separator after each device
+            self.get_logger().info("Finished processing LiDAR information from file.")
+        except FileNotFoundError:
+            self.get_logger().error(f"LVX file not found: {self.lvx_file_path}. Cannot display LiDAR information.")
+        except Exception as e:
+            self.get_logger().error(f"An error occurred while displaying LiDAR information: {e}")
+            import traceback
+            self.get_logger().error(traceback.format_exc())
+        finally:
+            self.get_logger().info("Display LiDAR information task complete. Initiating node shutdown.")
+            self._initiate_shutdown()
 
     def start_processing_once(self):
         if self.timer:
             self.timer.cancel() # Ensure this runs only once
+
+        if self.list_lidars:
+            self.get_logger().info("List Lidars mode activated.") # Add log
+            if not self.lvx_file_path or not os.path.exists(self.lvx_file_path):
+                self.get_logger().error(f"LVX file path is invalid or file does not exist: {self.lvx_file_path} for listing.")
+                self._initiate_shutdown() # Initiate shutdown directly
+                return
+            self.display_lidar_information_and_exit() # This method handles printing and its own shutdown
+            return # Crucial: prevent process_lvx_file() call
+
+        # If not list_lidars, proceed to normal processing
         self.process_lvx_file()
 
 
@@ -153,15 +265,31 @@ class Lvx2ParserNode(Node):
                 self.get_logger().info(f"    Extrinsics (R,P,Y,X,Y,Z): {roll:.2f}deg, {pitch:.2f}deg, {yaw:.2f}deg, {x:.2f}m, {y:.2f}m, {z:.2f}m") # [cite: 42]
 
                 device_frame_id = f"{self.lidar_frame_id_prefix}{lidar_id}"
-                imu_frame_id = f"{device_frame_id}_imu"
-                self.device_infos_[lidar_id] = {
+                imu_frame_id = f"{self.lidar_frame_id_prefix}{lidar_id}_imu" # Consistent frame ID naming
+
+                current_device_info = {
                     'sn': lidar_sn,
+                    'hub_sn': hub_sn,
                     'frame_id': device_frame_id,
-                    'imu_frame_id': imu_frame_id, # Add this new key
-                    'type': device_type,
-                    'roll_deg': roll, 'pitch_deg': pitch, 'yaw_deg': yaw,
+                    'imu_frame_id': imu_frame_id,
+                    'type': device_type, # Store original type code
                     'extrinsic_enable': extrinsic_enable
                 }
+                if extrinsic_enable == 1:
+                    current_device_info.update({
+                        'roll_deg': roll,
+                        'pitch_deg': pitch,
+                        'yaw_deg': yaw,
+                        'x': x, 'y': y, 'z': z
+                    })
+                self.device_infos_[lidar_id] = current_device_info
+
+                # Conditional creation based on selected_lidar_ids
+                if self.selected_lidar_ids and lidar_id not in self.selected_lidar_ids:
+                    self.get_logger().info(f"    LiDAR ID {lidar_id} (SN: {lidar_sn}) is filtered out by lidar_ids parameter. Skipping ROS resource creation (publishers, TF).")
+                    continue # Skip to the next device in the loop
+
+                self.get_logger().info(f"    LiDAR ID {lidar_id} (SN: {lidar_sn}) is selected. Creating publishers and TF.")
 
                 # Create PointCloud2 publisher
                 pc_topic_name = f"{self.pc_topic_prefix}{lidar_id}"
@@ -173,28 +301,34 @@ class Lvx2ParserNode(Node):
                     t = geometry_msgs.msg.TransformStamped()
                     t.header.stamp = self.get_clock().now().to_msg() # TF is timeless but StaticBroadcaster needs a stamp
                     t.header.frame_id = self.base_frame_id
-                    t.child_frame_id = device_frame_id
+                    # Use frame_id from current_device_info for consistency, though it's same as local device_frame_id here
+                    t.child_frame_id = current_device_info['frame_id']
 
-                    t.transform.translation.x = float(x)
-                    t.transform.translation.y = float(y)
-                    t.transform.translation.z = float(z)
+                    t.transform.translation.x = float(current_device_info['x'])
+                    t.transform.translation.y = float(current_device_info['y'])
+                    t.transform.translation.z = float(current_device_info['z'])
 
-                    q = self.euler_to_quaternion(math.radians(roll), math.radians(pitch), math.radians(yaw))
+                    q = self.euler_to_quaternion(math.radians(current_device_info['roll_deg']),
+                                                 math.radians(current_device_info['pitch_deg']),
+                                                 math.radians(current_device_info['yaw_deg']))
                     t.transform.rotation.x = q[0]
                     t.transform.rotation.y = q[1]
                     t.transform.rotation.z = q[2]
                     t.transform.rotation.w = q[3]
                     self.static_broadcaster_.sendTransform(t)
-                    self.get_logger().info(f"    Published static transform for {device_frame_id} relative to {self.base_frame_id}")
+                    self.get_logger().info(f"    Published static transform for {current_device_info['frame_id']} relative to {self.base_frame_id}")
 
                     # Create and broadcast the static transform for the IMU relative to the LiDAR
                     t_imu = geometry_msgs.msg.TransformStamped()
                     t_imu.header.stamp = self.get_clock().now().to_msg() # Use current time for static transform
-                    t_imu.header.frame_id = device_frame_id  # Parent is the LiDAR frame
-                    t_imu.child_frame_id = imu_frame_id   # Child is the new IMU frame
+                    t_imu.header.frame_id = current_device_info['frame_id']  # Parent is the LiDAR frame
+                    t_imu.child_frame_id = current_device_info['imu_frame_id']   # Child is the new IMU frame
 
-                    # Set the translation based on the Livox Mid-360 User Manual (page 17)
-                    # x=11.0 mm, y=23.29 mm, z=-44.12 mm
+                    # Set the translation based on the Livox Mid-360 User Manual (page 17) for Mid-360
+                    # For other LiDARs, these values might be different or (0,0,0) if IMU is co-located.
+                    # This example uses Mid-360 values. A more robust solution might involve
+                    # device_type specific offsets or reading them from a config if they vary.
+                    # For now, assuming these are generally applicable or a placeholder.
                     t_imu.transform.translation.x = 0.011
                     t_imu.transform.translation.y = 0.02329
                     t_imu.transform.translation.z = -0.04412
@@ -206,7 +340,7 @@ class Lvx2ParserNode(Node):
                     t_imu.transform.rotation.w = 1.0
 
                     self.static_broadcaster_.sendTransform(t_imu)
-                    self.get_logger().info(f"    Published static transform for {imu_frame_id} relative to {device_frame_id}")
+                    self.get_logger().info(f"    Published static transform for {current_device_info['imu_frame_id']} relative to {current_device_info['frame_id']}")
 
                     # Create IMU publisher
                     imu_topic_name = f"{self.imu_topic_prefix}{lidar_id}"
@@ -446,6 +580,10 @@ class Lvx2ParserNode(Node):
 
             # After all packages for this frame are read, publish PointCloud2 and IMU messages
             for lidar_id, collected_data in points_by_lidar_in_frame.items():
+                if self.selected_lidar_ids and lidar_id not in self.selected_lidar_ids:
+                    self.get_logger().debug(f"Skipping LiDAR ID {lidar_id} as it's not in the selected list for frame {frame_idx}.")
+                    continue # Skip to the next LiDAR ID in the frame
+
                 if not collected_data['points_bytes_list']:
                     continue
 
