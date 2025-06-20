@@ -536,16 +536,243 @@ class Lvx2Checker:
             print_ok("File check completed. No major issues detected in parsed sections.")
         print_header("--- End of Summary ---")
 
+    def truncate_file(self, num_frames_to_keep, output_filepath):
+        print_header(f"Starting truncation of LVX2 file: {self.filepath}")
+        print_info(f"Number of frames to keep: {num_frames_to_keep}")
+        print_info(f"Output file: {output_filepath}")
+
+        if num_frames_to_keep < 0:
+            print_fail("Number of frames to keep cannot be negative.")
+            return False
+
+        # Note: self.file_size, self.device_count, public/private headers, device_infos
+        # should already be populated by the logic in main() before this method is called.
+        if not hasattr(self, 'public_header_data') or not self.public_header_data:
+             print_fail("Public header data not parsed. Call relevant parsing functions first.")
+             return False
+        if not hasattr(self, 'private_header_data') or not self.private_header_data:
+             print_fail("Private header data not parsed. Call relevant parsing functions first.")
+             return False
+        if not hasattr(self, 'device_infos'): # device_infos can be empty if device_count is 0
+             print_fail("Device info not parsed. Call relevant parsing functions first.")
+             return False
+
+
+        try:
+            with open(self.filepath, 'rb') as infile, open(output_filepath, 'wb') as outfile:
+                # 1. Header Copying
+                infile.seek(0)
+                public_header = infile.read(24)
+                if len(public_header) < 24:
+                    print_fail("Failed to read public header from input file.")
+                    return False
+                outfile.write(public_header)
+                # print_info("Public header copied.") # Verbose, consider removing for cleaner output
+
+                private_header = infile.read(5)
+                if len(private_header) < 5:
+                    print_fail("Failed to read private header from input file.")
+                    return False
+                outfile.write(private_header)
+                # print_info("Private header copied.")
+
+                device_info_size = self.device_count * 63
+                if device_info_size > 0:
+                    device_info_block = infile.read(device_info_size)
+                    if len(device_info_block) < device_info_size:
+                        print_fail(f"Failed to read full device info block. Expected {device_info_size}, got {len(device_info_block)}")
+                        return False
+                    outfile.write(device_info_block)
+                    # print_info(f"Device info block ({self.device_count} devices, {device_info_size} bytes) copied.")
+                # else:
+                    # print_info("No device info block to copy (device_count is 0).")
+
+                if num_frames_to_keep == 0:
+                    print_info("Requested 0 frames. Output file will contain only headers.")
+                    return True
+
+                frames_written = 0
+                # current_frame_offset_in_file should be the position after headers
+                current_frame_offset_in_file = 24 + 5 + device_info_size
+
+                initial_first_frame_offset_check = infile.tell()
+                if initial_first_frame_offset_check != current_frame_offset_in_file:
+                    print_warn(f"File pointer after reading headers is {initial_first_frame_offset_check}, expected {current_frame_offset_in_file}. This might indicate issues if not 0 frames were requested.")
+                    # For safety, explicitly seek to the calculated start of frames if proceeding.
+                    # However, if num_frames_to_keep is > 0, an error here is more likely.
+                    # If this warning appears, it means the infile.read() sequence above didn't leave the pointer where expected.
+
+                while frames_written < num_frames_to_keep:
+                    infile.seek(current_frame_offset_in_file)
+                    frame_header_bytes = infile.read(24)
+
+                    if not frame_header_bytes or len(frame_header_bytes) < 24:
+                        if frames_written > 0:
+                             print_warn(f"Reached EOF or short read for frame header {frames_written + 1} at offset {current_frame_offset_in_file}. "
+                                       f"Input file has {frames_written} frames. Output will contain these frames.")
+                        else:
+                            print_fail(f"Reached EOF or short read for the first frame header (frame {frames_written + 1}) at offset {current_frame_offset_in_file}. "
+                                       f"Input file might be header-only or corrupted. Cannot write {num_frames_to_keep} frames.")
+                        break
+
+                    # Unpack original frame header to get offsets and frame_idx
+                    # We use current_frame_offset_in_file as the definitive current_offset_abs for the output file.
+                    _, next_offset_abs_original, frame_idx_original = struct.unpack('<QQQ', frame_header_bytes)
+
+                    frame_size = 0
+                    if next_offset_abs_original == 0: # Last frame in the input file
+                        frame_size = self.file_size - current_frame_offset_in_file
+                    else:
+                        # Check for malformed next_offset_abs_original
+                        if next_offset_abs_original < current_frame_offset_in_file :
+                             print_fail(f"Frame {frame_idx_original} (input) has next_offset_abs {next_offset_abs_original} which is before its current_offset_abs {current_frame_offset_in_file}. Corruption suspected.")
+                             return False # Critical error
+                        frame_size = next_offset_abs_original - current_frame_offset_in_file
+
+                    if frame_size <= 0 :
+                        print_fail(f"Frame {frame_idx_original} (input) would have non-positive size {frame_size} (current_abs: {current_frame_offset_in_file}, next_abs_original: {next_offset_abs_original}). Stopping.")
+                        return False
+
+                    frame_data_without_header_size = frame_size - 24
+                    if frame_data_without_header_size < 0:
+                        print_fail(f"Frame {frame_idx_original} (input) has calculated data_without_header_size < 0 ({frame_data_without_header_size}). Frame size: {frame_size}. Stopping.")
+                        return False
+
+                    # Determine if this is the last frame for the output.
+                    is_last_frame_for_output = (frames_written == num_frames_to_keep - 1) or \
+                                               (next_offset_abs_original == 0 and frames_written < num_frames_to_keep)
+
+                    output_next_offset_abs = 0
+                    if not is_last_frame_for_output:
+                        # The 'next_offset_abs' for the output frame points to the start of the *next* output frame.
+                        # This is current_frame_offset_in_file (start of current frame) + frame_size (size of current frame)
+                        output_next_offset_abs = current_frame_offset_in_file + frame_size
+
+                    # Frame index in output should be sequential starting from 0 or 1.
+                    # Using frames_written as 0-indexed frame_idx for output.
+                    output_frame_header_bytes = struct.pack('<QQQ', current_frame_offset_in_file, output_next_offset_abs, frames_written)
+
+                    outfile.write(output_frame_header_bytes)
+
+                    # Read frame data from input (current_frame_offset_in_file + 24) and write to output
+                    infile.seek(current_frame_offset_in_file + 24)
+                    frame_data = infile.read(frame_data_without_header_size)
+
+                    if len(frame_data) < frame_data_without_header_size:
+                        print_warn(f"Frame {frame_idx_original} (input): Read only {len(frame_data)} bytes of data, expected {frame_data_without_header_size}. "
+                                   f"Output frame {frames_written} will be truncated. This will likely be the last frame in the output.")
+                        outfile.write(frame_data)
+                        frames_written += 1
+                        # Since data is incomplete, this effectively becomes the last frame.
+                        # We need to ensure its header (already written) had next_offset_abs = 0.
+                        # This requires seeking back and rewriting the header if output_next_offset_abs was not 0.
+                        if output_next_offset_abs != 0:
+                            print_info(f"Correcting header for partially written output frame {frames_written-1} to set next_offset_abs to 0.")
+                            current_out_pos = outfile.tell()
+                            outfile.seek(current_frame_offset_in_file) # Go to start of this frame in output
+                            corrected_header = struct.pack('<QQQ', current_frame_offset_in_file, 0, frames_written -1)
+                            outfile.write(corrected_header)
+                            outfile.seek(current_out_pos) # Return to end for subsequent operations if any (though loop will break)
+                        break
+
+                    outfile.write(frame_data)
+                    frames_written += 1
+                    print_info(f"Written frame {frames_written}/{num_frames_to_keep} (Input Frame Index: {frame_idx_original}, Size: {frame_size} bytes). Output NextOffset: {output_next_offset_abs}")
+
+                    if is_last_frame_for_output:
+                        print_info(f"Last designated frame written. Total frames written: {frames_written}.")
+                        break
+
+                    # Prepare for next iteration for the input file reading
+                    if next_offset_abs_original == 0: # Reached end of input file naturally
+                        print_info(f"Reached end of input file (original next_offset_abs is 0). Total frames written: {frames_written}.")
+                        if frames_written < num_frames_to_keep:
+                             print_warn(f"Input file had only {frames_written} frames, less than requested {num_frames_to_keep}.")
+                        break
+
+                    if next_offset_abs_original >= self.file_size: # Safety break
+                        print_warn(f"Original next_offset_abs {next_offset_abs_original} is at/beyond EOF. Total frames written: {frames_written}.")
+                        break
+
+                    # The current_frame_offset_in_file for the *output* is advanced by frame_size.
+                    # The current_frame_offset_in_file for the *input* for the next loop iteration is next_offset_abs_original.
+                    current_frame_offset_in_file = next_offset_abs_original
+
+
+                print_info(f"Truncation loop finished. Total frames written: {frames_written} to {output_filepath}")
+                if frames_written == 0 and num_frames_to_keep > 0:
+                    print_warn("No frames were written to the output file, though frames were requested. Input file might be header-only or too short.")
+                elif frames_written < num_frames_to_keep and num_frames_to_keep > 0 :
+                     print_warn(f"Wrote {frames_written} frames, but {num_frames_to_keep} were requested. Input file was shorter than expected.")
+
+
+        except FileNotFoundError:
+            # This specific check for self.filepath should ideally be done before opening.
+            # The main function already checks for input filepath existence.
+            print_fail(f"Error: Input file {self.filepath} not accessible or output path for {output_filepath} is invalid.")
+            return False
+        except IOError as e:
+            print_fail(f"IOError during file operations: {e}")
+            return False
+        except Exception as e:
+            print_fail(f"An unexpected error occurred during truncation: {e}")
+            import traceback
+            print(traceback.format_exc())
+            return False
+
+        return True
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Checks the integrity and analyzes LVX2 files.")
-    parser.add_argument("filepath", help="Path to the LVX2 file to check.")
+    parser = argparse.ArgumentParser(description="Checks the integrity, analyzes, or truncates LVX2 files.")
+    parser.add_argument("filepath", help="Path to the LVX2 file.")
+    parser.add_argument("-t", "--truncate", type=int, help="Number of frames to keep in the output file.")
+    parser.add_argument("-o", "--output", help="Path to the output LVX2 file (required if --truncate is used).")
     args = parser.parse_args()
 
     checker = Lvx2Checker(args.filepath)
-    if not checker.check_file():
-        sys.exit(1)
-    sys.exit(0)
+
+    if args.truncate is not None:
+        if not args.output:
+            print_fail("--output <output_filepath> is required when --truncate is specified.")
+            sys.exit(1)
+        if args.truncate < 0:
+            print_fail("Number of frames for truncate must be non-negative.")
+            sys.exit(1)
+
+        # Ensure necessary headers are parsed before truncation
+        if not os.path.exists(args.filepath):
+            print_fail(f"Input file not found: {args.filepath}")
+            sys.exit(1)
+
+        checker.file_size = os.path.getsize(args.filepath)
+        try:
+            with open(args.filepath, 'rb') as f_check:
+                checker.f = f_check # Temporarily assign for header parsing
+                if not checker._parse_public_header():
+                    print_fail("Public header parsing failed. Cannot truncate.")
+                    sys.exit(1)
+                if not checker._parse_private_header():
+                    print_fail("Private header parsing failed. Cannot truncate.")
+                    sys.exit(1)
+                if not checker._parse_device_info_block(): # This reads from checker.f
+                    print_fail("Device info block parsing failed. Cannot truncate.")
+                    sys.exit(1)
+            checker.f = None # Release the file handle
+        except Exception as e:
+            print_fail(f"Error during initial header parsing for truncation: {e}")
+            sys.exit(1)
+
+        if checker.truncate_file(args.truncate, args.output):
+            print_ok(f"File truncated successfully to {args.output}")
+            sys.exit(0)
+        else:
+            print_fail("File truncation failed.")
+            sys.exit(1)
+    else:
+        if not checker.check_file():
+            sys.exit(1)
+        sys.exit(0)
 
 if __name__ == '__main__':
     main()
