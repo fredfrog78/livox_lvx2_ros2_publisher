@@ -14,6 +14,7 @@ import time
 import os
 import numpy as np
 import sys # Import sys for explicit exit
+import gc # For garbage collection control and stats
 
 # Helper function to convert Livox timestamp (nanoseconds) to ROS Time
 def livox_ts_to_ros_time(timestamp_ns):
@@ -47,6 +48,9 @@ class Lvx2ParserNode(Node):
                                ParameterDescriptor(
                                    description='Comma-separated list of LiDAR IDs to filter playback. Can be set as a string or an integer if only one ID and no comma is used.',
                                    dynamic_typing=True)) # Enable dynamic typing
+        self.declare_parameter('manual_gc_test_mode', False,
+                             ParameterDescriptor(description='Enable manual GC control for testing.', type=ParameterType.PARAMETER_BOOL))
+
 
         # Get parameters
         self.lvx_file_path = self.get_parameter('lvx_file_path').get_parameter_value().string_value
@@ -58,6 +62,9 @@ class Lvx2ParserNode(Node):
         self.playback_rate_hz = self.get_parameter('playback_rate_hz').get_parameter_value().double_value
         self.loop_playback = self.get_parameter('loop_playback').get_parameter_value().bool_value
         self.list_lidars = self.get_parameter('list_lidars').get_parameter_value().bool_value
+        self.manual_gc_test_mode = self.get_parameter('manual_gc_test_mode').get_parameter_value().bool_value
+        if self.manual_gc_test_mode:
+            self.get_logger().warn("Manual GC Test Mode is ENABLED. GC will be controlled explicitly.")
 
         # Get the lidar_ids parameter (which will be a ParameterValue object due to dynamic_typing)
         param_value_msg = self.get_parameter('lidar_ids').get_parameter_value()
@@ -384,6 +391,11 @@ class Lvx2ParserNode(Node):
         # This will be replaced by current_cycle_start_time_ns for calculating processing time of the current cycle.
 
         while rclpy.ok():
+            if self.manual_gc_test_mode:
+                gc.disable()
+            gc_counts_before = gc.get_count()
+            self.get_logger().debug(f"Loop Iteration {frame_count_overall} (Pre-Proc): GC Counts (gen0, gen1, gen2): {gc_counts_before}")
+
             current_cycle_start_time_ns = self.get_clock().now().nanoseconds # For overall cycle time measurement
             frame_processing_start_time_ns = current_cycle_start_time_ns # Specifically for package reading part
 
@@ -534,6 +546,10 @@ class Lvx2ParserNode(Node):
             package_reading_done_time_ns = self.get_clock().now().nanoseconds
             self.get_logger().info(f"Frame {frame_idx}: Time spent reading all packages: {(package_reading_done_time_ns - frame_processing_start_time_ns) / 1e6:.2f} ms")
 
+            # Log point 1: Before starting iteration through LiDARs for conversion/publishing
+            self.get_logger().info(f"Frame {frame_idx}: Starting iteration through LiDARs for conversion/publishing. Time since package reading done: {(self.get_clock().now().nanoseconds - package_reading_done_time_ns) / 1e6:.2f} ms")
+            iteration_start_time_ns = self.get_clock().now().nanoseconds
+
             # Determine the timestamp for publishing messages for THIS frame
             # and for calculating delay relative to the PREVIOUS frame.
             frame_publication_ts_ns_for_header = None
@@ -551,6 +567,22 @@ class Lvx2ParserNode(Node):
                 frame_publication_ts_ns_for_header = self.get_clock().now().nanoseconds
 
             # --- Timestamp-based replay delay calculation ---
+            # GC logging and manual collection will happen before this sleep logic
+
+            gc_counts_after = gc.get_count()
+            self.get_logger().info(
+                f"Loop Iteration {frame_count_overall} (Post-Proc): GC Counts (gen0, gen1, gen2): {gc_counts_after}. "
+                f"Delta from pre-proc: ({gc_counts_after[0]-gc_counts_before[0]}, "
+                f"{gc_counts_after[1]-gc_counts_before[1]}, {gc_counts_after[2]-gc_counts_before[2]})"
+            )
+
+            if self.manual_gc_test_mode:
+                manual_gc_start_time = self.get_clock().now().nanoseconds
+                gc.collect() # Manually trigger collection
+                manual_gc_duration_ms = (self.get_clock().now().nanoseconds - manual_gc_start_time) / 1e6
+                self.get_logger().warn(f"Loop Iteration {frame_count_overall}: Manual gc.collect() took: {manual_gc_duration_ms:.2f} ms")
+                gc.enable()
+
             if self.use_original_timestamps:
                 if previous_frame_original_ts_for_delay_calc_ns is not None and \
                    current_frame_first_pkg_ts_ns is not None:
@@ -683,11 +715,16 @@ class Lvx2ParserNode(Node):
                     self.get_logger().debug(f"Frame {frame_idx}, LiDAR {lidar_id}: Publishing PC2 (and IMU): {(publish_done_time_ns - data_conversion_done_time_ns) / 1e6:.2f} ms (PC2 conv to IMU pub end)")
                     # Note: This timing includes IMU publish. If IMU not present, it's mostly PC2 publish time.
                 else: # No IMU publish
-                    publish_done_time_ns = self.get_clock().now().nanoseconds
+                    publish_done_time_ns = self.get_clock().now().nanoseconds # This is effectively the end of this LiDAR's processing for timing
                     self.get_logger().debug(f"Frame {frame_idx}, LiDAR {lidar_id}: Publishing PC2: {(publish_done_time_ns - data_conversion_done_time_ns) / 1e6:.2f} ms (PC2 conv to PC2 pub end)")
 
-            all_publishing_done_time_ns = self.get_clock().now().nanoseconds
-            self.get_logger().info(f"Frame {frame_idx}: Time spent converting & publishing all messages: {(all_publishing_done_time_ns - package_reading_done_time_ns) / 1e6:.2f} ms")
+                # Log point 2: End of current LiDAR iteration
+                self.get_logger().info(f"Frame {frame_idx}, LiDAR {lidar_id}: Finished processing. Time for this LiDAR iteration: {(self.get_clock().now().nanoseconds - data_conversion_start_time_ns) / 1e6:.2f} ms")
+
+            # Log point 3: After iterating through all LiDARs
+            self.get_logger().info(f"Frame {frame_idx}: Finished iteration through all LiDARs. Total iteration time: {(self.get_clock().now().nanoseconds - iteration_start_time_ns) / 1e6:.2f} ms")
+            all_publishing_done_time_ns = self.get_clock().now().nanoseconds # This timestamp is still useful for the overall conversion & publishing block
+            self.get_logger().info(f"Frame {frame_idx}: Time spent converting & publishing all messages (cumulative from package_reading_done): {(all_publishing_done_time_ns - package_reading_done_time_ns) / 1e6:.2f} ms")
 
             frame_count_overall += 1
             if next_offset_abs == 0: # Last frame processed

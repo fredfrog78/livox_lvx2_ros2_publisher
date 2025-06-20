@@ -55,6 +55,11 @@ def generate_launch_description():
             default_value='',
             description='Comma-separated list of LiDAR IDs to filter playback (e.g., "0,2"). Empty means all.'
         ),
+        DeclareLaunchArgument(
+            'manual_gc_test_mode',
+            default_value='False',
+            description='Enable manual GC control for testing publisher performance.'
+        ),
 
         Node(
             package='livox_lvx2_ros2_publisher',
@@ -71,7 +76,8 @@ def generate_launch_description():
                 'playback_rate_hz': LaunchConfiguration('playback_rate_hz'),
                 'loop_playback': LaunchConfiguration('loop_playback'),
                 'list_lidars': LaunchConfiguration('list_lidars'),
-                'lidar_ids': LaunchConfiguration('lidar_ids') # No comma needed if it's the last item in dict
+                'lidar_ids': LaunchConfiguration('lidar_ids'),
+                'manual_gc_test_mode': LaunchConfiguration('manual_gc_test_mode'),
             }],
             arguments=['--ros-args', '--log-level', 'lvx2_parser_node:=debug']
         )
