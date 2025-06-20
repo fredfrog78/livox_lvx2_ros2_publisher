@@ -386,7 +386,7 @@ class Lvx2ParserNode(Node):
         current_frame_offset_in_file = file_start_of_point_cloud_data_block
 
         frame_count_overall = 0
-        previous_frame_original_ts_for_delay_calc_ns = None
+        # Removed: previous_frame_original_ts_for_delay_calc_ns = None
         # Removed: time_system_at_start_of_prev_frame_publish_cycle_ns
         # This will be replaced by current_cycle_start_time_ns for calculating processing time of the current cycle.
 
