@@ -232,15 +232,35 @@ class Lvx2ParserNode(Node):
             if len(data) < 5:
                 self.get_logger().error("Private Header: Unexpected EOF.")
                 return False
-            frame_duration, device_count = struct.unpack('<IB', data) # [cite: 30]
-            self.get_logger().info(f"  Frame Duration: {frame_duration} ms") # [cite: 31]
-            self.get_logger().info(f"  Device Count: {device_count}") # [cite: 34]
-        if frame_duration != 50 and frame_duration != 0 : # Allow 0 if it means unspecified by device/file
-             self.get_logger().warning(f"Frame duration is {frame_duration}ms, standard is 50ms for LVX2 v2.0.0.0 (or 0 if to be derived).")
+            frame_duration, device_count = struct.unpack('<IB', data)
+            self.get_logger().info(f"  Frame Duration from file: {frame_duration} ms")
+            self.get_logger().info(f"  Device Count from file: {device_count}")
+
+            if frame_duration != 50 and frame_duration != 0: # Allow 0 if it means unspecified
+                self.get_logger().warning(
+                    f"Frame duration from file is {frame_duration}ms. Standard is 50ms for LVX2 v2.0.0.0 (or 0 if to be derived by application)."
+                )
+
             self.device_count = device_count
-            self.device_frame_duration_ms = frame_duration # Store for potential use in timestamp calculations
-        self.get_logger().info(f"Effective parameter from file - device_frame_duration_ms: {self.device_frame_duration_ms} (Type: {type(self.device_frame_duration_ms)})")
+            if device_count <= 0:
+                self.get_logger().error(f"Device count from file is {device_count}, which is invalid. Playback cannot continue.")
+                return False
+
+            self.device_frame_duration_ms = frame_duration
+            if self.device_frame_duration_ms == 0:
+                 self.get_logger().warning(
+                    f"Device frame duration from file is 0ms. This may cause playback to run as fast as possible in 'use_original_timestamps' mode if not handled."
+                 )
+                 # Default to 50ms for pacing calculations if file provides 0.
+                 # This ensures that use_original_timestamps mode has a sane default target delay.
+                 self.device_frame_duration_ms = 50
+                 self.get_logger().info(f"  For node's internal pacing logic, device_frame_duration_ms is set to {self.device_frame_duration_ms}ms due to 0ms in file.")
+
+            self.get_logger().info(
+                f"Effective for node - device_frame_duration_ms: {self.device_frame_duration_ms}ms (Type: {type(self.device_frame_duration_ms)})"
+            )
             return True
+
         except struct.error as e:
             self.get_logger().error(f"Error parsing Private Header: {e}")
             return False
