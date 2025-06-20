@@ -58,8 +58,8 @@ def generate_launch_description():
 
         Node(
             package='livox_lvx2_ros2_publisher',
-            executable='lvx2_publisher',  # Entry point from setup.py
-            name='lvx2_parser_node',      # Node name
+            executable='lvx2_publisher',  # Assumed entry point from setup.py
+            name='lvx2_parser_node',      # Node name defined in the Python script
             output='screen',
             parameters=[{
                 'lvx_file_path': LaunchConfiguration('lvx_file_path'),
@@ -71,7 +71,8 @@ def generate_launch_description():
                 'playback_rate_hz': LaunchConfiguration('playback_rate_hz'),
                 'loop_playback': LaunchConfiguration('loop_playback'),
                 'list_lidars': LaunchConfiguration('list_lidars'),
-                'lidar_ids': LaunchConfiguration('lidar_ids'),
-            }]
+                'lidar_ids': LaunchConfiguration('lidar_ids') # No comma needed if it's the last item in dict
+            }],
+            arguments=['--ros-args', '--log-level', 'lvx2_parser_node:=debug']
         )
     ])
