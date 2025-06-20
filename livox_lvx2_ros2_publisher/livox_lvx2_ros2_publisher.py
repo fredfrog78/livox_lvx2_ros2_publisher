@@ -63,6 +63,12 @@ class Lvx2ParserNode(Node):
         self.loop_playback = self.get_parameter('loop_playback').get_parameter_value().bool_value
         self.list_lidars = self.get_parameter('list_lidars').get_parameter_value().bool_value
         self.manual_gc_test_mode = self.get_parameter('manual_gc_test_mode').get_parameter_value().bool_value
+
+        self.get_logger().info(f"Effective initial parameter - use_original_timestamps: {self.use_original_timestamps} (Type: {type(self.use_original_timestamps)})")
+        self.get_logger().info(f"Effective initial parameter - playback_rate_hz: {self.playback_rate_hz} (Type: {type(self.playback_rate_hz)})")
+        # self.device_frame_duration_ms is initialized to 50 and updated in _parse_private_header
+        self.get_logger().info(f"Initial default value - device_frame_duration_ms: {self.device_frame_duration_ms} (Type: {type(self.device_frame_duration_ms)})")
+
         if self.manual_gc_test_mode:
             self.get_logger().warn("Manual GC Test Mode is ENABLED. GC will be controlled explicitly.")
 
@@ -229,10 +235,11 @@ class Lvx2ParserNode(Node):
             frame_duration, device_count = struct.unpack('<IB', data) # [cite: 30]
             self.get_logger().info(f"  Frame Duration: {frame_duration} ms") # [cite: 31]
             self.get_logger().info(f"  Device Count: {device_count}") # [cite: 34]
-            if frame_duration != 50: # For version 2.0.0.0 [cite: 33]
-                 self.get_logger().warning(f"Frame duration is {frame_duration}ms, expected 50ms for LVX2 v2.0.0.0.")
+        if frame_duration != 50 and frame_duration != 0 : # Allow 0 if it means unspecified by device/file
+             self.get_logger().warning(f"Frame duration is {frame_duration}ms, standard is 50ms for LVX2 v2.0.0.0 (or 0 if to be derived).")
             self.device_count = device_count
             self.device_frame_duration_ms = frame_duration # Store for potential use in timestamp calculations
+        self.get_logger().info(f"Effective parameter from file - device_frame_duration_ms: {self.device_frame_duration_ms} (Type: {type(self.device_frame_duration_ms)})")
             return True
         except struct.error as e:
             self.get_logger().error(f"Error parsing Private Header: {e}")
@@ -583,48 +590,52 @@ class Lvx2ParserNode(Node):
                 self.get_logger().warn(f"Loop Iteration {frame_count_overall}: Manual gc.collect() took: {manual_gc_duration_ms:.2f} ms")
                 gc.enable()
 
+            # --- Pre-Sleep Check Logging ---
+            self.get_logger().info(
+                f"Frame {frame_idx} - Pre-Sleep Check: use_original_timestamps={self.use_original_timestamps}, "
+                f"playback_rate_hz={self.playback_rate_hz}, device_frame_duration_ms={self.device_frame_duration_ms}"
+            )
+
             if self.use_original_timestamps:
-                if previous_frame_original_ts_for_delay_calc_ns is not None and \
-                   current_frame_first_pkg_ts_ns is not None:
-                    target_delay_from_timestamps_ns = current_frame_first_pkg_ts_ns - previous_frame_original_ts_for_delay_calc_ns
-                else: # First frame or issue with current_frame_first_pkg_ts_ns (e.g. empty frame)
-                    target_delay_from_timestamps_ns = self.device_frame_duration_ms * 1_000_000
+                # This 'previous_frame_original_ts_for_delay_calc_ns' was removed in a previous step.
+                # The logic now directly uses device_frame_duration_ms for target_delay_ns
+                # or relies on the any_lidar_had_timestamp_issue_this_frame flag.
+                # The following block is the simplified logic from the previous successful patch.
+                target_delay_ns = self.device_frame_duration_ms * 1_000_000
+                if any_lidar_had_timestamp_issue_this_frame:
+                    self.get_logger().info(
+                        f"Frame {frame_idx}: Note: A LiDAR had a timestamp issue (non-monotonic or first packet). "
+                        f"Pacing is based on device_frame_duration ({self.device_frame_duration_ms}ms)."
+                    )
+                # The old complex logic for target_delay_from_timestamps_ns based on
+                # current_frame_first_pkg_ts_ns and previous_frame_original_ts_for_delay_calc_ns
+                # and its override conditions are now replaced by the simpler logic above and below.
 
-                # Override target_delay if overall frame timestamp is non-monotonic or any LiDAR had an issue
-                if target_delay_from_timestamps_ns < 0 or any_lidar_had_timestamp_issue_this_frame:
-                    if target_delay_from_timestamps_ns < 0 and not any_lidar_had_timestamp_issue_this_frame:
-                        self.get_logger().info(
-                            f"Frame {frame_idx}: Overall frame-level non-monotonic timestamp detected "
-                            f"(FirstPktTS: {current_frame_first_pkg_ts_ns} vs PrevFirstPktTS: {previous_frame_original_ts_for_delay_calc_ns}). "
-                            "Using device frame duration for pacing."
-                        )
-                    elif any_lidar_had_timestamp_issue_this_frame:
-                         self.get_logger().info(
-                            f"Frame {frame_idx}: A LiDAR had a timestamp issue (non-monotonic or first packet). "
-                            "Using device frame duration for pacing."
-                        )
-                    # If target_delay_from_timestamps_ns was positive but any_lidar_had_timestamp_issue_this_frame is true,
-                    # it implies the issue was purely per-LiDAR and didn't make the overall frame delta negative.
-                    # Still, we use default pacing for caution.
-                    
-                    target_delay_from_timestamps_ns = self.device_frame_duration_ms * 1_000_000
-
-                # Calculate time spent on current cycle's processing so far (before sleep)
                 time_spent_on_current_cycle_ns = self.get_clock().now().nanoseconds - current_cycle_start_time_ns
+                sleep_duration_ns = max(0, target_delay_ns - time_spent_on_current_cycle_ns)
 
-                sleep_duration_ns = max(0, target_delay_from_timestamps_ns - time_spent_on_current_cycle_ns)
                 if sleep_duration_ns > 0:
                     time.sleep(sleep_duration_ns / 1_000_000_000.0)
-                    self.get_logger().debug(f"Frame {frame_idx}: Slept for {sleep_duration_ns / 1e6:.2f} ms. Target delay: {target_delay_from_timestamps_ns/1e6:.2f}ms, Current cycle processing: {time_spent_on_current_cycle_ns/1e6:.2f}ms.")
 
-                # Update for next iteration's delay calculation
-                if current_frame_first_pkg_ts_ns is not None: # Only update if current frame provided a valid timestamp
-                     previous_frame_original_ts_for_delay_calc_ns = current_frame_first_pkg_ts_ns
+                self.get_logger().debug(
+                    f"Frame {frame_idx}: Original timestamp mode. Target delay: {target_delay_ns / 1e6:.2f}ms, "
+                    f"Cycle processing: {time_spent_on_current_cycle_ns / 1e6:.2f}ms, "
+                    f"Slept for: {sleep_duration_ns / 1e6:.2f}ms."
+                )
             else: # Fallback to fixed rate playback
+                time_spent_on_current_cycle_ns = self.get_clock().now().nanoseconds - current_cycle_start_time_ns # Recalculate for fixed rate
                 if self.playback_rate_hz > 0:
-                    # Note: This simple sleep doesn't account for processing time.
-                    # For more accurate fixed rate, processing time would need to be subtracted.
-                    time.sleep(1.0 / self.playback_rate_hz)
+                    target_delay_ns = 1_000_000_000.0 / self.playback_rate_hz
+                    sleep_duration_ns = max(0, target_delay_ns - time_spent_on_current_cycle_ns)
+
+                    if sleep_duration_ns > 0:
+                        time.sleep(sleep_duration_ns / 1_000_000_000.0)
+
+                    self.get_logger().debug(
+                        f"Frame {frame_idx}: Fixed rate playback. Target rate: {self.playback_rate_hz}Hz ({target_delay_ns/1e6:.2f}ms), "
+                        f"Cycle processing: {time_spent_on_current_cycle_ns / 1e6:.2f}ms, "
+                        f"Slept for: {sleep_duration_ns / 1e6:.2f}ms."
+                    )
             
             ros_frame_publish_time = livox_ts_to_ros_time(frame_publication_ts_ns_for_header)
 
